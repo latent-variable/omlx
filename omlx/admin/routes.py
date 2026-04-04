@@ -2476,6 +2476,14 @@ def _build_runtime_cache_observability(
         elif not isinstance(prefix_stats, dict):
             prefix_stats = {}
 
+        cache_debug = runtime_stats.get("cache_debug")
+        if is_dataclass(cache_debug):
+            cache_debug = asdict(cache_debug)
+        elif hasattr(cache_debug, "to_dict"):
+            cache_debug = cache_debug.to_dict()
+        elif not isinstance(cache_debug, dict):
+            cache_debug = {}
+
         indexed_blocks_value = indexed_blocks if isinstance(indexed_blocks, int) else 0
         if not isinstance(block_size, int) or block_size <= 0:
             block_size = int(prefix_stats.get("block_size", 0) or 0)
@@ -2513,6 +2521,7 @@ def _build_runtime_cache_observability(
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
+            "cache_debug": cache_debug,
         }
 
         payload["models"].append(model_payload)

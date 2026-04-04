@@ -1425,6 +1425,21 @@ class TestCacheCorruptionRecovery:
         for req in scheduler.waiting:
             assert req.cache_corruption_retries == 0
 
+    def test_get_ssd_cache_stats_includes_cache_debug(
+        self, mock_model, mock_tokenizer
+    ):
+        """Scheduler exposes cache debug counters and connectivity flags."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        stats = scheduler.get_ssd_cache_stats()
+
+        assert stats is not None
+        assert stats["cache_debug"]["cache_configured"] is False
+        assert stats["cache_debug"]["prefix_cache_connected"] is False
+        assert stats["cache_debug"]["ssd_backend_connected"] is False
+        assert stats["cache_debug"]["fetch_hits"] == 0
+        assert stats["cache_debug"]["fetch_misses"] == 0
+
     def test_fail_all_requests_clears_everything(
         self, mock_model, mock_tokenizer
     ):

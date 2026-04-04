@@ -660,6 +660,13 @@ class TestRuntimeCacheObservability:
                 "last_partial_tokens_skipped": 577,
                 "last_tokens_to_next_block": 447,
             },
+            "cache_debug": {
+                "cache_configured": True,
+                "prefix_cache_connected": True,
+                "ssd_backend_connected": True,
+                "fetch_hits": 3,
+                "fetch_misses": 4,
+            },
         }
 
         entry = SimpleNamespace(
@@ -686,6 +693,8 @@ class TestRuntimeCacheObservability:
         assert model_payload["has_sub_block_cache"] is True
         assert model_payload["indexed_blocks_display"] == "<1024"
         assert model_payload["last_partial_tokens_skipped"] == 577
+        assert model_payload["cache_debug"]["ssd_backend_connected"] is True
+        assert model_payload["cache_debug"]["fetch_hits"] == 3
 
 
 class TestGlobalSettingsValidation:

@@ -1290,6 +1290,16 @@ class Scheduler:
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self.paged_ssd_cache_manager: Optional["PagedSSDCacheManager"] = None
         self.memory_monitor: Optional["MemoryMonitor"] = None
+        self._cache_debug_counters: Dict[str, int] = {
+            "lookup_requests": 0,
+            "fetch_hits": 0,
+            "fetch_misses": 0,
+            "reconstructed_hits": 0,
+            "reconstruct_failures": 0,
+            "exact_hit_trim_adjustments": 0,
+            "exact_hit_stateful_fallbacks": 0,
+            "exact_hit_trim_failures": 0,
+        }
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -2775,6 +2785,7 @@ class Scheduler:
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
+            self._cache_debug_counters["lookup_requests"] += 1
             # Use paged cache
             # Build extra_keys for VLM image hash prefix cache isolation
             extra_keys = None
@@ -2787,12 +2798,14 @@ class Scheduler:
                 extra_keys=extra_keys,
             )
             if block_table and block_table.num_tokens > 0:
+                self._cache_debug_counters["fetch_hits"] += 1
                 # Reconstruct actual KVCache objects from stored tensor data
                 # Note: reconstruct_cache may modify block_table in-place if
                 # partial reconstruction occurs (some blocks invalid)
                 original_tokens = block_table.num_tokens
                 reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
                 if reconstructed:
+                    self._cache_debug_counters["reconstructed_hits"] += 1
                     request.prompt_cache = reconstructed
                     request.block_table = block_table
                     request.cached_tokens = block_table.num_tokens
@@ -2815,12 +2828,18 @@ class Scheduler:
                             request.cached_tokens = 0
                             request.shared_prefix_blocks = 0
                             request.remaining_tokens = request.prompt_token_ids
+                            self._cache_debug_counters[
+                                "exact_hit_stateful_fallbacks"
+                            ] += 1
                             logger.debug(
                                 f"Request {request.request_id}: exact cache hit with "
                                 f"stateful cache type, falling back to full prefill "
                                 f"for deterministic kickoff"
                             )
                         elif self._trim_prompt_cache_for_generation(request.prompt_cache):
+                            self._cache_debug_counters[
+                                "exact_hit_trim_adjustments"
+                            ] += 1
                             request.cached_tokens = max(0, request.cached_tokens - 1)
                             request.remaining_tokens = request.prompt_token_ids[-1:]
                             logger.debug(
@@ -2840,6 +2859,9 @@ class Scheduler:
                             request.cached_tokens = 0
                             request.shared_prefix_blocks = 0
                             request.remaining_tokens = request.prompt_token_ids
+                            self._cache_debug_counters[
+                                "exact_hit_trim_failures"
+                            ] += 1
                             logger.debug(
                                 f"Request {request.request_id}: exact cache hit could "
                                 f"not be trimmed safely, falling back to full prefill"
@@ -2858,6 +2880,7 @@ class Scheduler:
                             f"{len(request.remaining_tokens)} tokens remaining, cache reconstructed"
                         )
                 else:
+                    self._cache_debug_counters["reconstruct_failures"] += 1
                     # Reconstruction failed, treat as cache miss
                     if self.paged_cache_manager is not None:
                         self.paged_cache_manager.delete_block_table(request.request_id)
@@ -2867,6 +2890,7 @@ class Scheduler:
                         "released shared blocks"
                     )
             else:
+                self._cache_debug_counters["fetch_misses"] += 1
                 request.remaining_tokens = request.prompt_token_ids
         else:
             # No paged SSD cache configured - process all tokens
@@ -4753,7 +4777,15 @@ class Scheduler:
 
     def get_ssd_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get paged SSD + prefix cache observability statistics."""
-        stats = {}
+        stats = {
+            "cache_debug": {
+                **self._cache_debug_counters,
+                "cache_configured": bool(self.config.paged_ssd_cache_dir),
+                "prefix_cache_connected": self.block_aware_cache is not None,
+                "ssd_backend_connected": self.paged_ssd_cache_manager is not None,
+                "model_name": self.config.model_name,
+            }
+        }
 
         if self.paged_ssd_cache_manager is not None:
             stats["ssd_cache"] = self.paged_ssd_cache_manager.get_stats()
