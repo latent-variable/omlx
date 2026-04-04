@@ -92,6 +92,7 @@ logs/
 tmp/
 temp/
 *.tmp
+benchmark_results/
 
 # MLX cache
 .mlx_cache/
