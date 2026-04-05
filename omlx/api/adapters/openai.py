@@ -133,6 +133,7 @@ class OpenAIAdapter(BaseAdapter):
                 prompt_tokens=response.prompt_tokens,
                 completion_tokens=response.completion_tokens,
                 total_tokens=response.prompt_tokens + response.completion_tokens,
+                cached_tokens=response.cached_tokens or None,
             ),
         )
 
@@ -180,6 +181,7 @@ class OpenAIAdapter(BaseAdapter):
                 prompt_tokens=chunk.prompt_tokens,
                 completion_tokens=chunk.completion_tokens,
                 total_tokens=chunk.prompt_tokens + chunk.completion_tokens,
+                cached_tokens=chunk.cached_tokens or None,
             )
 
         return f"data: {response.model_dump_json(exclude_none=True)}\n\n"

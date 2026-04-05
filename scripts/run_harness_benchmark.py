@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 
 from omlx.benchmarking.runner import (
+    analyze_opencode_session,
+    analyze_pi_session,
     analyze_pi_trace,
     load_benchmark_result,
     render_result_to_json,
@@ -19,7 +21,14 @@ from omlx.benchmarking.runner import (
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze harness cache behavior for oMLX")
-    parser.add_argument("--pi-trace", required=True, help="Path to pi-prompt-trace.jsonl")
+    parser.add_argument("--pi-trace", help="Path to pi-prompt-trace.jsonl")
+    parser.add_argument("--pi-session-jsonl", help="Path to Pi session .jsonl")
+    parser.add_argument("--opencode-session-id", help="OpenCode session id to analyze")
+    parser.add_argument(
+        "--opencode-db",
+        default=str(Path.home() / ".local/share/opencode/opencode.db"),
+        help="Path to the OpenCode SQLite database",
+    )
     parser.add_argument("--workload-id", default="ad_hoc")
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--output-dir", default="benchmark_results")
@@ -43,11 +52,28 @@ def main() -> int:
     json_path = output_dir / "report.json"
     html_path = output_dir / "dashboard.html"
 
-    result = analyze_pi_trace(
-        args.pi_trace,
-        workload_id=args.workload_id,
-        block_size=args.block_size,
-    )
+    provided_inputs = sum(bool(value) for value in (args.pi_trace, args.pi_session_jsonl, args.opencode_session_id))
+    if provided_inputs != 1:
+        parser.error("pass exactly one of --pi-trace, --pi-session-jsonl, or --opencode-session-id")
+
+    if args.pi_trace:
+        result = analyze_pi_trace(
+            args.pi_trace,
+            workload_id=args.workload_id,
+            block_size=args.block_size,
+        )
+    elif args.pi_session_jsonl:
+        result = analyze_pi_session(
+            args.pi_session_jsonl,
+            workload_id=args.workload_id,
+            block_size=args.block_size,
+        )
+    else:
+        result = analyze_opencode_session(
+            args.opencode_session_id,
+            db_path=args.opencode_db,
+            workload_id=args.workload_id,
+        )
     markdown = render_result_to_markdown(result, output_path=markdown_path)
     payload = render_result_to_json(result, output_path=json_path)
     comparison_results = [load_benchmark_result(path) for path in args.compare_report_json]

@@ -142,7 +142,7 @@ def render_html_dashboard(results: list[BenchmarkResult], *, title: str = "oMLX 
         if not entries:
             return ""
         left = 200
-        right = 24
+        right = 108
         top = 18
         bottom = 28
         plot_width = width - left - right
@@ -158,7 +158,7 @@ def render_html_dashboard(results: list[BenchmarkResult], *, title: str = "oMLX 
             bars.append(
                 f"<text x='{left - 10}' y='{y + bar_height * 0.65:.1f}' class='axis-label axis-left'>{html.escape(entry_label)}</text>"
                 f"<rect x='{left}' y='{y:.1f}' width='{bar_width:.1f}' height='{bar_height:.1f}' rx='8' fill='var(--accent)' />"
-                f"<text x='{left + bar_width + 8:.1f}' y='{y + bar_height * 0.65:.1f}' class='bar-value'>{html.escape(fmt_int(value))}</text>"
+                f"<text x='{width - 12}' y='{y + bar_height * 0.65:.1f}' class='bar-value bar-value-right'>{html.escape(fmt_int(value))}</text>"
             )
         return (
             "<div class='chart-card'>"
@@ -196,11 +196,11 @@ def render_html_dashboard(results: list[BenchmarkResult], *, title: str = "oMLX 
         )
 
     best_reuse = max(comparison_rows, key=lambda row: float(row["median_reuse"]))
-    best_reprocess = min(comparison_rows, key=lambda row: float(row["median_reprocessed"]))
+    best_reprocess = min(comparison_rows, key=lambda row: float(row["median_reprocessed_fraction"]))
     summary_cards = [
         ("Reports", fmt_int(len(results)), "Combined benchmark result sets in this dashboard."),
         ("Best median reuse", fmt_pct(float(best_reuse["median_reuse"])), f"{best_reuse['label']}"),
-        ("Lowest median recompute", fmt_int(float(best_reprocess["median_reprocessed"])), f"{best_reprocess['label']} chars"),
+        ("Lowest median recompute fraction", fmt_pct(float(best_reprocess["median_reprocessed_fraction"])), str(best_reprocess["label"])),
         (
             "Worst single-turn recompute",
             fmt_int(max(float(row["max_reprocessed"]) for row in comparison_rows)),
@@ -227,14 +227,14 @@ def render_html_dashboard(results: list[BenchmarkResult], *, title: str = "oMLX 
     if len(comparison_rows) > 1:
         comparison_chart = (
             "<section class='panel'>"
-            "<div class='panel-header'><h2>Run Comparison</h2><p>Use these to compare block sizes or later, different harness adapters.</p></div>"
+            "<div class='panel-header'><h2>Run Comparison</h2><p>Cross-harness comparisons emphasize ratios so Pi trace estimates and OpenCode token stats stay comparable.</p></div>"
             + bar_chart_svg(
-                [(str(row["label"]), float(row["median_reprocessed"])) for row in comparison_rows],
-                label="Median estimated recompute chars",
+                [(str(row["label"]), float(row["median_reuse"]) * 100) for row in comparison_rows],
+                label="Median reuse ratio (%)",
             )
             + bar_chart_svg(
-                [(str(row["label"]), float(row["max_reprocessed"])) for row in comparison_rows],
-                label="Worst single-turn recompute chars",
+                [(str(row["label"]), float(row["median_reprocessed_fraction"]) * 100) for row in comparison_rows],
+                label="Median recompute fraction (%)",
             )
             + "</section>"
         )
@@ -248,11 +248,14 @@ def render_html_dashboard(results: list[BenchmarkResult], *, title: str = "oMLX 
     }
     for result in results:
         turns = result.turns
+        prompt_unit = str(result.config.metadata.get("prompt_unit", "chars"))
+        unit_label = "tokens" if prompt_unit == "tokens" else "chars"
         prompt_values = [turn.prompt_chars_total for turn in turns]
         prefix_values = [turn.block_aligned_prefix_chars for turn in turns]
         reprocessed_values = [turn.reprocessed_chars_estimate for turn in turns]
         reuse_values = [turn_reuse_ratio(turn.prompt_chars_total, turn.block_aligned_prefix_chars) * 100 for turn in turns]
         replay_turns = [turn.turn_index for turn in turns if turn.likely_replay_after_abort]
+        worst_turns = sorted(turns, key=lambda turn: turn.reprocessed_chars_estimate, reverse=True)[:5]
         turn_rows = "".join(
             "<tr>"
             f"<td>{turn.turn_index}</td>"
@@ -266,24 +269,35 @@ def render_html_dashboard(results: list[BenchmarkResult], *, title: str = "oMLX 
             "</tr>"
             for turn in turns
         )
+        worst_turn_rows = "".join(
+            "<tr>"
+            f"<td>{turn.turn_index}</td>"
+            f"<td>{fmt_int(turn.reprocessed_chars_estimate)}</td>"
+            f"<td>{fmt_pct((turn.reprocessed_chars_estimate / turn.prompt_chars_total) if turn.prompt_chars_total else 0.0)}</td>"
+            f"<td>{'yes' if turn.likely_replay_after_abort else ''}</td>"
+            f"<td>{html.escape(str(turn.metadata.get('finish', turn.metadata.get('divergence_index_vs_prev', ''))))}</td>"
+            "</tr>"
+            for turn in worst_turns
+        )
         result_sections.append(
             "<section class='panel'>"
             f"<div class='panel-header'><h2>{html.escape(result_label(result))}</h2>"
-            f"<p>Model <code>{html.escape(result.config.model_id)}</code> with block size <code>{result.config.block_size}</code>.</p></div>"
+            f"<p>Model <code>{html.escape(result.config.model_id)}</code> with unit <code>{unit_label}</code> and block size <code>{result.config.block_size}</code>.</p></div>"
             "<div class='metrics-grid'>"
             f"<div class='metric'><span class='metric-label'>Turns</span><strong>{fmt_int(len(turns))}</strong></div>"
-            f"<div class='metric'><span class='metric-label'>Median recompute</span><strong>{fmt_int(result.summary.get('median_reprocessed_chars_estimate', 0))}</strong></div>"
-            f"<div class='metric'><span class='metric-label'>Max recompute</span><strong>{fmt_int(result.summary.get('max_reprocessed_chars_estimate', 0))}</strong></div>"
+            f"<div class='metric'><span class='metric-label'>Median recompute ({unit_label})</span><strong>{fmt_int(result.summary.get('median_reprocessed_chars_estimate', 0))}</strong></div>"
+            f"<div class='metric'><span class='metric-label'>Median recompute fraction</span><strong>{fmt_pct(float(result.summary.get('median_reprocessed_fraction', 0.0)))}</strong></div>"
+            f"<div class='metric'><span class='metric-label'>Max recompute ({unit_label})</span><strong>{fmt_int(result.summary.get('max_reprocessed_chars_estimate', 0))}</strong></div>"
             f"<div class='metric'><span class='metric-label'>Replay-after-abort turns</span><strong>{fmt_int(result.summary.get('turns_after_abort', 0))}</strong></div>"
             "</div>"
             "<div class='chart-grid'>"
             + series_svg(
                 [
-                    ("Prompt chars", prompt_values, palette["prompt"]),
-                    ("Block-aligned prefix", prefix_values, palette["prefix"]),
+                    (f"Prompt {unit_label}", prompt_values, palette["prompt"]),
+                    ("Reusable prefix", prefix_values, palette["prefix"]),
                     ("Reprocessed estimate", reprocessed_values, palette["reprocessed"]),
                 ],
-                y_label="Chars per turn",
+                y_label=f"{unit_label.capitalize()} per turn",
                 event_positions=replay_turns,
             )
             + series_svg(
@@ -292,8 +306,11 @@ def render_html_dashboard(results: list[BenchmarkResult], *, title: str = "oMLX 
                 event_positions=replay_turns,
             )
             + "</div>"
+            "<div class='table-wrap section-table'><table>"
+            "<thead><tr><th>Top fragile turns</th><th>Reprocessed</th><th>Recompute ratio</th><th>After abort</th><th>Reason</th></tr></thead>"
+            f"<tbody>{worst_turn_rows}</tbody></table></div>"
             "<div class='table-wrap'><table>"
-            "<thead><tr><th>Turn</th><th>Prompt chars</th><th>Common prefix</th><th>Block-aligned prefix</th><th>Reprocessed est.</th><th>Reuse</th><th>Msgs</th><th>After abort</th></tr></thead>"
+            f"<thead><tr><th>Turn</th><th>Prompt {unit_label}</th><th>Common prefix</th><th>Reusable prefix</th><th>Reprocessed est.</th><th>Reuse</th><th>Msgs</th><th>After abort</th></tr></thead>"
             f"<tbody>{turn_rows}</tbody></table></div>"
             "</section>"
         )
@@ -473,12 +490,14 @@ def render_html_dashboard(results: list[BenchmarkResult], *, title: str = "oMLX 
       font-size: 12px;
       font-family: "SFMono-Regular", "Menlo", "Consolas", monospace;
     }}
+    .bar-value-right {{ text-anchor: end; }}
     .table-wrap {{
       overflow: auto;
       border: 1px solid var(--border);
       border-radius: 18px;
       background: rgba(255,255,255,0.88);
     }}
+    .section-table {{ margin-bottom: 16px; }}
     table {{
       width: 100%;
       border-collapse: collapse;

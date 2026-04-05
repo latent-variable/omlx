@@ -208,6 +208,12 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: Optional[str] = "stop"
 
 
+class PromptTokensDetails(BaseModel):
+    """OpenAI-compatible prompt token detail fields."""
+
+    cached_tokens: Optional[int] = None
+
+
 class Usage(BaseUsage):
     """Token usage statistics for OpenAI API.
 
@@ -216,6 +222,7 @@ class Usage(BaseUsage):
     """
 
     cached_tokens: Optional[int] = None
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
     # Timing metrics (oMLX extension, seconds)
     model_load_duration: Optional[float] = None
     time_to_first_token: Optional[float] = None
@@ -224,6 +231,15 @@ class Usage(BaseUsage):
     generation_duration: Optional[float] = None
     prompt_tokens_per_second: Optional[float] = None
     generation_tokens_per_second: Optional[float] = None
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        if self.prompt_tokens_details is None and self.cached_tokens is not None:
+            object.__setattr__(
+                self,
+                "prompt_tokens_details",
+                PromptTokensDetails(cached_tokens=self.cached_tokens),
+            )
 
 
 class ChatCompletionResponse(BaseModel):

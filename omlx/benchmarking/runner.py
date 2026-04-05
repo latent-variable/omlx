@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .analysis import load_pi_trace, summarize_trace
+from .analysis import load_pi_trace, summarize_opencode_session, summarize_pi_session, summarize_trace
 from .reports import render_html_dashboard, render_markdown
 from .schema import BenchmarkResult, BenchmarkRunConfig, BenchmarkTurn
 
@@ -24,6 +24,24 @@ def analyze_pi_trace(
         workload_id=workload_id,
         block_size=block_size,
     )
+
+
+def analyze_opencode_session(
+    session_id: str,
+    *,
+    db_path: str | Path,
+    workload_id: str,
+) -> BenchmarkResult:
+    return summarize_opencode_session(session_id, db_path=db_path, workload_id=workload_id)
+
+
+def analyze_pi_session(
+    pi_session_path: str | Path,
+    *,
+    workload_id: str,
+    block_size: int,
+) -> BenchmarkResult:
+    return summarize_pi_session(pi_session_path, workload_id=workload_id, block_size=block_size)
 
 
 def benchmark_result_from_dict(payload: dict) -> BenchmarkResult:

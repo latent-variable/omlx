@@ -1785,6 +1785,7 @@ async def create_completion(
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             total_tokens=total_prompt_tokens + total_completion_tokens,
+            cached_tokens=total_cached_tokens or None,
         ),
     )
 
@@ -2078,6 +2079,7 @@ async def create_chat_completion(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             total_tokens=output.prompt_tokens + output.completion_tokens,
+            cached_tokens=output.cached_tokens or None,
         ),
     )
 
