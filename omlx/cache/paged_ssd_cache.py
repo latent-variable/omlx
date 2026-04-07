@@ -645,7 +645,8 @@ class PagedSSDCacheManager(CacheManager):
 
         # Flush evicted entries to SSD outside the hot cache lock
         for evicted_hash, evicted in evicted_entries:
-            self._enqueue_ssd_write(evicted_hash, evicted)
+            if not self._enqueue_ssd_write(evicted_hash, evicted):
+                self._write_block_sync(evicted_hash, evicted)
 
     def _enqueue_ssd_write(self, block_hash: bytes, entry: Dict) -> bool:
         """Enqueue a hot cache entry for SSD background write.
@@ -684,6 +685,55 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.discard(block_hash)
+            return False
+
+    def _write_block_sync(self, block_hash: bytes, entry: Dict) -> bool:
+        """Synchronously persist a hot-cache entry to SSD.
+
+        This is a correctness fallback for cases where the async write queue
+        is saturated. It avoids silently dropping blocks that have already
+        been accepted into the cache.
+        """
+        blk_meta = entry.get('block_metadata')
+        if blk_meta is None:
+            return False
+
+        file_path = blk_meta.file_path
+        tensors_raw = entry['tensors_raw']
+        metadata = entry['file_metadata']
+        temp_path = None
+
+        try:
+            if not self._index.contains(block_hash):
+                self._enforce_size_limit_for_new_block()
+                self._index.add(blk_meta)
+
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
+            actual_size = _write_safetensors_no_mx(
+                str(temp_path), tensors_raw, metadata
+            )
+            os.rename(str(temp_path), str(file_path))
+            self._index.update_file_size(block_hash, actual_size)
+            logger.warning(
+                "SSD write queue full, synchronously persisted evicted block %s",
+                block_hash.hex()[:16],
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                "Synchronous SSD write failed for %s: %s",
+                block_hash.hex()[:16],
+                e,
+            )
+            self._stats["errors"] += 1
+            self._index.remove(block_hash)
+            for p in (temp_path, file_path):
+                try:
+                    if p is not None and isinstance(p, Path) and p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
             return False
 
     def _hot_cache_get(self, block_hash: bytes) -> Optional[Dict]:
@@ -1560,6 +1610,32 @@ class PagedSSDCacheManager(CacheManager):
         with self._hot_cache_lock:
             return block_hash in self._hot_cache
 
+    def describe_block_state(self, block_hash: bytes) -> Dict[str, Any]:
+        """
+        Describe where a block currently lives for cache debugging.
+
+        Returns a lightweight snapshot of hot-cache, pending-write, SSD index,
+        and on-disk file state for the given block hash.
+        """
+        with self._hot_cache_lock:
+            in_hot_cache = block_hash in self._hot_cache
+
+        with self._pending_write_hashes_lock:
+            pending_write = block_hash in self._pending_write_hashes
+
+        metadata = self._index.get(block_hash)
+        indexed_on_ssd = metadata is not None
+        file_path = metadata.file_path if metadata is not None else self._get_file_path(block_hash)
+        file_exists = file_path.exists()
+
+        return {
+            "in_hot_cache": in_hot_cache,
+            "pending_write": pending_write,
+            "indexed_on_ssd": indexed_on_ssd,
+            "file_exists": file_exists,
+            "file_path": str(file_path),
+        }
+
     def delete_block(self, block_hash: bytes) -> bool:
         """
         Delete a block from SSD storage.
@@ -1918,5 +1994,3 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
-
-

@@ -13,6 +13,7 @@ The scheduler follows vLLM's design with:
 
 import copy
 import gc
+import hashlib
 import logging
 import time
 from collections import deque
@@ -32,7 +33,7 @@ from mlx_lm.sample_utils import make_sampler, make_logits_processors
 
 from pathlib import Path
 
-from .cache.paged_cache import PagedCacheManager
+from .cache.paged_cache import PagedCacheManager, compute_block_hash
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
@@ -2145,11 +2146,49 @@ class Scheduler:
             extra_keys = None
             if request.vlm_image_hash:
                 extra_keys = (request.vlm_image_hash,)
+            extra_key_token_start = (
+                request.vlm_cache_key_start if request.vlm_image_hash else None
+            )
+            extra_key_ranges = (
+                [
+                    (start, (image_hash,))
+                    for start, image_hash in request.vlm_cache_key_ranges
+                ]
+                if request.vlm_cache_key_ranges
+                else None
+            )
+
+            logger.info(
+                "Prompt fingerprint for %s: tokens=%s, hash=%s, prefixes=%s",
+                request.request_id,
+                len(request.prompt_token_ids),
+                self._prompt_fingerprint(request.prompt_token_ids),
+                " ".join(
+                    self._prefix_fingerprints(
+                        request.prompt_token_ids,
+                        extra_keys=extra_keys,
+                    )
+                ) or "none",
+            )
 
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
                 request.prompt_token_ids,
                 extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+            )
+            matched_tokens = (
+                len(request.prompt_token_ids) - len(remaining)
+                if remaining is not None
+                else 0
+            )
+            logger.info(
+                "Prefix cache lookup for %s: matched_tokens=%s/%s, remaining=%s",
+                request.request_id,
+                matched_tokens,
+                len(request.prompt_token_ids),
+                len(remaining) if remaining is not None else "unknown",
             )
             if block_table and block_table.num_tokens > 0:
                 # Reconstruct actual KVCache objects from stored tensor data
@@ -2162,6 +2201,7 @@ class Scheduler:
                     request.block_table = block_table
                     request.cached_tokens = block_table.num_tokens
                     request.shared_prefix_blocks = len(block_table.block_ids)
+                    cache_types = self._describe_cache_types(request.prompt_cache)
                     # Recalculate remaining_tokens in case block_table was truncated
                     request.remaining_tokens = request.prompt_token_ids[block_table.num_tokens:]
                     # For exact prefix hits we need cache state at (N-1) and the
@@ -2169,25 +2209,17 @@ class Scheduler:
                     # Reusing cache state at N and feeding the last token again
                     # shifts the model state and can change greedy output.
                     if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
-                        if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
-                            # Stateful non-sliceable caches (Rotating/Arrays)
-                            # cannot be safely converted from N to N-1 state
-                            # without cache-type-specific logic.
-                            if self.paged_cache_manager is not None:
-                                self.paged_cache_manager.delete_block_table(request.request_id)
-                            request.prompt_cache = None
-                            request.block_table = None
-                            request.cached_tokens = 0
-                            request.shared_prefix_blocks = 0
-                            request.remaining_tokens = request.prompt_token_ids
-                            logger.debug(
-                                f"Request {request.request_id}: exact cache hit with "
-                                f"stateful cache type, falling back to full prefill "
-                                f"for deterministic kickoff"
-                            )
-                        elif self._trim_prompt_cache_for_generation(request.prompt_cache):
+                        if self._trim_prompt_cache_for_generation(request.prompt_cache):
                             request.cached_tokens = max(0, request.cached_tokens - 1)
                             request.remaining_tokens = request.prompt_token_ids[-1:]
+                            logger.info(
+                                "Exact cache hit reused for %s: cache_types=%s, "
+                                "kickoff=N-1, cached_tokens=%s, remaining_tokens=%s",
+                                request.request_id,
+                                cache_types,
+                                request.cached_tokens,
+                                len(request.remaining_tokens),
+                            )
                             logger.debug(
                                 f"Request {request.request_id}: exact cache hit adjusted "
                                 f"to N-1 state for generation kickoff "
@@ -2205,6 +2237,13 @@ class Scheduler:
                             request.cached_tokens = 0
                             request.shared_prefix_blocks = 0
                             request.remaining_tokens = request.prompt_token_ids
+                            logger.info(
+                                "Exact cache hit fallback for %s: cache_types=%s, "
+                                "reason=cache_not_trimmable, prefill_tokens=%s",
+                                request.request_id,
+                                cache_types,
+                                len(request.remaining_tokens),
+                            )
                             logger.debug(
                                 f"Request {request.request_id}: exact cache hit could "
                                 f"not be trimmed safely, falling back to full prefill"
@@ -2425,6 +2464,66 @@ class Scheduler:
             if not self._trim_cache_tree_by_one(cache_obj):
                 return False
         return True
+
+    def _describe_cache_types(self, cache_list: Optional[List[Any]]) -> str:
+        """Return a compact description of cache types for logging."""
+        if not cache_list:
+            return "none"
+
+        type_names: List[str] = []
+        seen = set()
+
+        def collect(cache_obj: Any) -> None:
+            sub_caches = getattr(cache_obj, "caches", None)
+            if isinstance(sub_caches, (list, tuple)):
+                for sub_cache in sub_caches:
+                    collect(sub_cache)
+                return
+
+            name = type(cache_obj).__name__
+            if name not in seen:
+                seen.add(name)
+                type_names.append(name)
+
+        for cache_obj in cache_list:
+            collect(cache_obj)
+
+        return ", ".join(type_names) if type_names else "unknown"
+
+    def _prompt_fingerprint(self, tokens: List[int]) -> str:
+        """Return a short stable fingerprint for a token sequence."""
+        if not tokens:
+            return "empty"
+
+        hasher = hashlib.sha256()
+        hasher.update(",".join(map(str, tokens)).encode("utf-8"))
+        return hasher.hexdigest()[:16]
+
+    def _prefix_fingerprints(
+        self, tokens: List[int], extra_keys: Optional[Tuple[Any, ...]] = None
+    ) -> List[str]:
+        """Return compact fingerprints for growing full-block prefixes."""
+        block_size = getattr(self.config, "paged_cache_block_size", 0)
+        if block_size <= 0 or not tokens:
+            return []
+
+        result: List[str] = []
+        parent_hash = None
+        num_full_blocks = len(tokens) // block_size
+
+        # Keep this concise but useful enough to pinpoint where drift begins.
+        for idx in range(min(num_full_blocks, 6)):
+            start = idx * block_size
+            end = start + block_size
+            parent_hash = compute_block_hash(
+                parent_hash,
+                tokens[start:end],
+                extra_keys=extra_keys,
+                model_name=self.config.model_name,
+            )
+            result.append(f"{end}:{parent_hash.hex()[:8]}")
+
+        return result
 
     def _trim_cache_tree_by_one(self, cache_obj: Any) -> bool:
         """Trim one token from cache object (recursively for CacheList)."""
@@ -3287,6 +3386,19 @@ class Scheduler:
                                 store_extra_keys = None
                                 if request.vlm_image_hash:
                                     store_extra_keys = (request.vlm_image_hash,)
+                                store_extra_key_token_start = (
+                                    request.vlm_cache_key_start
+                                    if request.vlm_image_hash
+                                    else None
+                                )
+                                store_extra_key_ranges = (
+                                    [
+                                        (start, (image_hash,))
+                                        for start, image_hash in request.vlm_cache_key_ranges
+                                    ]
+                                    if request.vlm_cache_key_ranges
+                                    else None
+                                )
 
                                 block_table = self.block_aware_cache.store_cache(
                                     request_id,
@@ -3295,6 +3407,8 @@ class Scheduler:
                                     model_cache_config=model_cache_config,
                                     boundary_snapshots=intermediate_snapshots,
                                     extra_keys=store_extra_keys,
+                                    extra_key_token_start=store_extra_key_token_start,
+                                    extra_key_ranges=store_extra_key_ranges,
                                 )
                             logger.debug(
                                 f"Stored paged cache for request {request_id} "

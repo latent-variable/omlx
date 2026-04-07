@@ -41,6 +41,28 @@ logger = logging.getLogger(__name__)
 BlockHash = NewType("BlockHash", bytes)
 
 
+def resolve_block_extra_keys(
+    block_end: int,
+    extra_keys: Optional[Tuple[Any, ...]] = None,
+    extra_key_token_start: Optional[int] = None,
+    extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
+) -> Optional[Tuple[Any, ...]]:
+    """Resolve which cache key salt applies to a block ending at ``block_end``."""
+    if extra_key_ranges:
+        selected = None
+        for start, keys in extra_key_ranges:
+            if block_end > start:
+                selected = keys
+            else:
+                break
+        return selected
+    if extra_keys is not None and (
+        extra_key_token_start is None or block_end > extra_key_token_start
+    ):
+        return extra_keys
+    return None
+
+
 def compute_block_hash(
     parent_hash: Optional[BlockHash],
     token_ids: List[int],
@@ -923,6 +945,8 @@ class PagedCacheManager(CacheManager):
         self,
         token_ids: List[int],
         extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
     ) -> Tuple[List[CacheBlock], int]:
         """
         Find cached blocks for a token prefix (vLLM style).
@@ -948,11 +972,17 @@ class PagedCacheManager(CacheManager):
                 start = i * self.block_size
                 end = start + self.block_size
                 block_tokens = token_ids[start:end]
+                block_extra_keys = resolve_block_extra_keys(
+                    end,
+                    extra_keys=extra_keys,
+                    extra_key_token_start=extra_key_token_start,
+                    extra_key_ranges=extra_key_ranges,
+                )
 
                 # Compute expected hash
                 block_hash = compute_block_hash(
                     parent_hash, block_tokens,
-                    extra_keys=extra_keys, model_name=self.model_name,
+                    extra_keys=block_extra_keys, model_name=self.model_name,
                 )
 
                 # Look up in cache
@@ -976,6 +1006,30 @@ class PagedCacheManager(CacheManager):
                             cached_block = block
 
                 if cached_block is None:
+                    if self._paged_ssd_cache_manager is not None:
+                        block_state = self._paged_ssd_cache_manager.describe_block_state(
+                            block_hash
+                        )
+                        logger.info(
+                            "Prefix cache miss at block=%s tokens=%s hash=%s "
+                            "hot=%s pending=%s indexed=%s file_exists=%s path=%s",
+                            i,
+                            end,
+                            block_hash.hex()[:16],
+                            block_state["in_hot_cache"],
+                            block_state["pending_write"],
+                            block_state["indexed_on_ssd"],
+                            block_state["file_exists"],
+                            block_state["file_path"],
+                        )
+                    else:
+                        logger.info(
+                            "Prefix cache miss at block=%s tokens=%s hash=%s "
+                            "(no paged SSD cache manager)",
+                            i,
+                            end,
+                            block_hash.hex()[:16],
+                        )
                     self.stats.misses += 1
                     break  # Cache miss, stop here
 
@@ -1103,6 +1157,8 @@ class PagedCacheManager(CacheManager):
         self,
         tokens: List[int],
         extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
     ) -> Tuple[List[int], List[int]]:
         """
         Find shared prefix blocks for a token sequence.
@@ -1110,7 +1166,10 @@ class PagedCacheManager(CacheManager):
         Uses get_computed_blocks for consistent chain-hash lookup.
         """
         cached_blocks, num_cached_tokens = self.get_computed_blocks(
-            tokens, extra_keys=extra_keys
+            tokens,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
         )
 
         shared_block_ids = [b.block_id for b in cached_blocks]

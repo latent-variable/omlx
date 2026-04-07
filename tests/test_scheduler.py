@@ -308,17 +308,21 @@ class TestSchedulerAddRequest:
         assert request.prompt_cache is None
         scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-fallback")
 
-    def test_add_request_exact_cache_hit_rotating_forces_fallback(
+    def test_add_request_exact_cache_hit_rotating_trims_one_token(
         self, mock_model, mock_tokenizer
     ):
-        """Rotating cache exact hit should fallback to full prefill."""
+        """Rotating cache exact hit should reuse cache when trim() is available."""
         from omlx.cache.paged_cache import BlockTable
 
-        RotatingCacheWithTrim = type(
-            "RotatingKVCache",
-            (),
-            {"trim": lambda self, n: n},
-        )
+        class RotatingCacheWithTrim:
+            trim_calls = 0
+
+            def trim(self, n):
+                self.trim_calls += 1
+                return n
+
+        rotating_cache = RotatingCacheWithTrim()
+        rotating_cache.__class__.__name__ = "RotatingKVCache"
 
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler.block_aware_cache = MagicMock()
@@ -326,7 +330,7 @@ class TestSchedulerAddRequest:
 
         block_table = BlockTable(request_id="req-rotating", block_ids=[9], num_tokens=4)
         scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
-        scheduler.block_aware_cache.reconstruct_cache.return_value = [RotatingCacheWithTrim()]
+        scheduler.block_aware_cache.reconstruct_cache.return_value = [rotating_cache]
 
         request = Request(
             request_id="req-rotating",
@@ -336,10 +340,11 @@ class TestSchedulerAddRequest:
 
         scheduler.add_request(request)
 
-        assert request.cached_tokens == 0
-        assert request.remaining_tokens == [31, 32, 33, 34]
-        assert request.prompt_cache is None
-        scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-rotating")
+        assert request.cached_tokens == 3
+        assert request.remaining_tokens == [34]
+        assert request.prompt_cache is not None
+        assert rotating_cache.trim_calls == 1
+        scheduler.paged_cache_manager.delete_block_table.assert_not_called()
 
 
 class TestSchedulerAbortRequest:

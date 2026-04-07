@@ -8,11 +8,13 @@ for better throughput when serving multiple concurrent requests.
 
 import copy
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..prompt_debug import dump_prompt_snapshot
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
@@ -371,6 +373,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -415,6 +418,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=request_id,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -439,6 +443,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -494,6 +499,7 @@ class BatchedEngine(BaseEngine):
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=request_id,
             **specprefill_kwargs,
         )
 
@@ -575,9 +581,21 @@ class BatchedEngine(BaseEngine):
         prompt = self._apply_chat_template(
             messages, template_tools, chat_template_kwargs=ct_kwargs
         )
+        request_id = str(uuid.uuid4())
+        dump_prompt_snapshot(
+            request_id=request_id,
+            model_name=self._model_name,
+            messages=messages,
+            tools=template_tools,
+            chat_template_kwargs=ct_kwargs,
+            prompt=prompt,
+            tokenizer=self.tokenizer,
+            extra={"engine": "batched", "stream": False},
+        )
 
         return await self.generate(
             prompt=prompt,
+            request_id=request_id,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -633,6 +651,17 @@ class BatchedEngine(BaseEngine):
         prompt = self._apply_chat_template(
             messages, template_tools, chat_template_kwargs=ct_kwargs
         )
+        request_id = str(uuid.uuid4())
+        dump_prompt_snapshot(
+            request_id=request_id,
+            model_name=self._model_name,
+            messages=messages,
+            tools=template_tools,
+            chat_template_kwargs=ct_kwargs,
+            prompt=prompt,
+            tokenizer=self.tokenizer,
+            extra={"engine": "batched", "stream": True},
+        )
 
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
@@ -654,6 +683,7 @@ class BatchedEngine(BaseEngine):
 
         async for output in self.stream_generate(
             prompt=prompt,
+            request_id=request_id,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
