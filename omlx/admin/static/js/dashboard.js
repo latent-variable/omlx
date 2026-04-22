@@ -34,7 +34,7 @@
                 model: { model_dirs: [''], max_model_memory: '' },
                 memory: { max_process_memory: 'auto', prefill_memory_guard: true },
                 scheduler: { max_concurrent_requests: 8 },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256 },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
                 sampling: { max_context_window: 32768, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '' },
                 huggingface: { endpoint: '' },
@@ -43,6 +43,7 @@
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
+                idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
             },
 
@@ -61,6 +62,9 @@
             editingProcessMemory: false,
             editingModelMemory: false,
             editingHotCache: false,
+
+            // Idle timeout string value for select binding (null ↔ '')
+            idleTimeoutValue: '',
 
             // Models
             models: [],
@@ -628,9 +632,15 @@
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
+                            idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
                         this.globalSettings.ui = data.ui || { language: 'en' };
+
+                        // Sync idle timeout select value
+                        this.idleTimeoutValue = this.globalSettings.idle_timeout?.idle_timeout_seconds != null
+                            ? String(this.globalSettings.idle_timeout.idle_timeout_seconds)
+                            : '';
 
                         // Calculate memory percent from stored value
                         if (this.globalSettings.model.max_model_memory === 'auto') {
@@ -734,6 +744,7 @@
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
                             hot_cache_max_size: this.globalSettings.cache.hot_cache_max_size,
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
+                            hot_cache_only: this.globalSettings.cache.hot_cache_only,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
                             sampling_temperature: this.globalSettings.sampling.temperature,
@@ -747,6 +758,7 @@
                             network_ca_bundle: this.globalSettings.network.ca_bundle,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
+                            idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
                         }),
                     });
 
@@ -1704,6 +1716,15 @@
             get displayHost() {
                 const host = this.selectedAlias || this.stats.host || '127.0.0.1';
                 return this.formatDisplayHost(host);
+            },
+
+            get ttlPlaceholder() {
+                if (this.selectedModel?.pinned) return window.t('modal.model_settings.ttl_pinned');
+                const globalTtl = this.globalSettings.idle_timeout?.idle_timeout_seconds;
+                if (globalTtl) {
+                    return window.t('modal.model_settings.ttl_global_fallback').replace('{seconds}', globalTtl);
+                }
+                return window.t('modal.model_settings.ttl_no_ttl');
             },
 
             async loadServerInfo() {
