@@ -32,6 +32,41 @@ logger = logging.getLogger(__name__)
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
+def _init_mlx_thread() -> None:
+    """Replace generation_stream with a thread-local stream on the executor thread.
+
+    Both mlx-lm and mlx-vlm create a module-level ``generation_stream`` at
+    import time.  mlx-lm (>=0.31.3) already uses ``new_thread_local_stream``,
+    but mlx-vlm may still use ``new_stream`` (a shared, non-thread-local
+    stream).  All MLX GPU ops are serialized onto this executor thread, and
+    arrays produced inside ``with mx.stream(generation_stream):`` blocks
+    carry that stream reference.  If the stream was created on the main
+    thread, subsequent ``.item()`` / ``mx.synchronize()`` calls from the
+    executor thread fail with "There is no Stream(gpu, 0) in current thread".
+
+    Fix: create a thread-local stream HERE and replace the module-level
+    ``generation_stream`` in mlx_lm, mlx_vlm, and omlx.scheduler.
+    """
+    import sys
+    import mlx.core as mx
+
+    stream = mx.new_thread_local_stream(mx.default_device())
+
+    gen_mod = sys.modules.get("mlx_lm.generate")
+    if gen_mod is not None:
+        gen_mod.generation_stream = stream
+
+    vlm_gen_mod = sys.modules.get("mlx_vlm.generate")
+    if vlm_gen_mod is not None:
+        vlm_gen_mod.generation_stream = stream
+
+    sched_mod = sys.modules.get("omlx.scheduler")
+    if sched_mod is not None:
+        sched_mod.generation_stream = stream
+
+    logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
+
+
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     """Get or create the global MLX executor (lazy singleton).
 
@@ -43,7 +78,8 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     global _global_mlx_executor
     if _global_mlx_executor is None:
         _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-global"
+            max_workers=1, thread_name_prefix="mlx-global",
+            initializer=_init_mlx_thread,
         )
     return _global_mlx_executor
 
