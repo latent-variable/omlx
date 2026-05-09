@@ -603,6 +603,22 @@ class EnginePool:
             if self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
 
+            # Native MTP forces LM-only dispatch even for VLM models. Vision
+            # encoder weights are ignored because the patched mtp_forward only
+            # exists on the language model path. mtp_enabled was already
+            # validated as mutually exclusive with dflash / turboquant in
+            # ModelSettings.__post_init__.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and effective_type == "vlm"
+            ):
+                logger.info(
+                    f"MTP enabled for VLM model {model_id}; "
+                    f"forcing LM-only dispatch, vision components ignored"
+                )
+                effective_type = "batched"
+
             # Check if DFlash is enabled — takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
@@ -619,6 +635,9 @@ class EnginePool:
                             model_settings=model_settings,
                             fallback_engine_type=effective_type,
                             scheduler_config=self._scheduler_config,
+                            omlx_ssd_cache_dir=getattr(
+                                self._scheduler_config, "paged_ssd_cache_dir", None
+                            ),
                         )
                         logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
                     except ImportError:
