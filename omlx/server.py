@@ -153,7 +153,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -164,6 +164,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    SchedulerQueueFullError,
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
@@ -341,6 +342,8 @@ async def lifespan(app: FastAPI):
                 settings_manager=_server_state.settings_manager,
                 prefill_memory_guard=_server_state.global_settings.memory.prefill_memory_guard,
                 global_settings=_server_state.global_settings,
+                soft_threshold=_server_state.global_settings.memory.soft_threshold,
+                hard_threshold=_server_state.global_settings.memory.hard_threshold,
             )
             _server_state.process_memory_enforcer = enforcer
             _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -524,6 +527,32 @@ async def validation_exception_handler(
     else:
         content = {"detail": exc.errors()}
     return JSONResponse(status_code=422, content=content)
+
+
+@app.exception_handler(SchedulerQueueFullError)
+async def scheduler_queue_full_handler(
+    request: FastAPIRequest, exc: SchedulerQueueFullError
+):
+    """Map scheduler queue cap exhaustion to HTTP 503 + Retry-After."""
+    logger.warning(
+        "%s %s → 503: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    detail = (
+        f"Scheduler waiting queue full ({exc.current_depth}/{exc.max_depth}). "
+        f"Try again shortly."
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(detail, 503)
+    else:
+        content = {"detail": detail}
+    return JSONResponse(
+        status_code=503,
+        content=content,
+        headers={"Retry-After": "1"},
+    )
 
 
 @app.exception_handler(Exception)
@@ -1136,7 +1165,7 @@ def init_server(
     logger.info(f"CORS origins: {cors_origins}")
 
     # Initialize model settings manager
-    base_path = Path(global_settings.base_path) if global_settings else Path(model_dir)
+    base_path = Path(global_settings.base_path) if global_settings else Path.home() / ".omlx"
     _server_state.settings_manager = ModelSettingsManager(base_path)
 
     # Get pinned models from settings file only (managed via admin page)
@@ -1755,6 +1784,13 @@ async def create_embeddings(
             f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
             f"{output.total_tokens} tokens in {elapsed:.3f}s"
         )
+        get_server_metrics().record_request_complete(
+            prompt_tokens=output.total_tokens,
+            completion_tokens=0,
+            cached_tokens=0,
+            prefill_duration=elapsed,
+            model_id=resolve_model_id(request.model) or request.model,
+        )
 
         data = []
         for i, embedding in enumerate(output.embeddings):
@@ -1869,6 +1905,13 @@ async def create_rerank(
         f"Rerank: {len(documents_raw)} docs, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
     )
+    get_server_metrics().record_request_complete(
+        prompt_tokens=output.total_tokens,
+        completion_tokens=0,
+        cached_tokens=0,
+        prefill_duration=elapsed,
+        model_id=resolve_model_id(request.model) or request.model,
+    )
 
     # Format response - results sorted by score (descending). Strings wrap
     # into {"text": "..."}; dict inputs pass through as-is so multimodal
@@ -1979,7 +2022,7 @@ async def create_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}")
 
         get_server_metrics().record_request_complete(
             prompt_tokens=total_prompt_tokens,
@@ -2106,6 +2149,11 @@ async def create_chat_completion(
             native_reasoning_content=native_reasoning,
         )
 
+    # Detect and strip partial mode at the API boundary — exactly once,
+    # before any chat template application.  The boolean result is forwarded
+    # as an explicit parameter so the engine never has to re-derive it.
+    is_partial = detect_and_strip_partial(messages)
+
     # Compile grammar for structured output (logit-level enforcement).
     # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
     response_format = request.response_format
@@ -2140,6 +2188,7 @@ async def create_chat_completion(
         num_prompt_tokens = engine.count_chat_tokens(
             messages, tools_for_template,
             chat_template_kwargs=merged_ct_kwargs or None,
+            is_partial=is_partial,
         )
     except Exception as e:
         # Catch chat template rendering failures: Jinja2 TemplateError,
@@ -2230,6 +2279,9 @@ async def create_chat_completion(
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
+    # Forward partial-mode decision to the engine explicitly
+    chat_kwargs["is_partial"] = is_partial
+
     # SpecPrefill: per-request overrides (fall back to model_settings)
     if request.specprefill is not None:
         chat_kwargs["specprefill"] = request.specprefill
@@ -2241,6 +2293,9 @@ async def create_chat_completion(
         chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
     elif _server_state.settings_manager and ms.specprefill_threshold is not None:
         chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
+
+    if request.stop:
+        chat_kwargs["stop"] = request.stop
 
     if request.stream:
         return StreamingResponse(
@@ -2261,7 +2316,7 @@ async def create_chat_completion(
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+        logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {output.prompt_tokens}")
 
         get_server_metrics().record_request_complete(
             prompt_tokens=output.prompt_tokens,
@@ -2656,6 +2711,8 @@ async def stream_completion(
             generation_duration=gen_duration,
             model_id=resolve_model_id(request.model) or request.model,
         )
+        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(f"Completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -2966,6 +3023,8 @@ async def stream_chat_completion(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(f"Chat completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -3118,17 +3177,33 @@ async def stream_anthropic_messages(
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
-                        # Close thinking block if transitioning to text
-                        if thinking_block_started and not text_block_started:
-                            yield create_content_block_stop_event(index=block_index)
-                            block_index += 1
-                            thinking_block_started = False
-                        if not text_block_started:
-                            yield create_content_block_start_event(
-                                index=block_index, block_type="text"
-                            )
-                            text_block_started = True
-                        yield create_text_delta_event(index=block_index, text=content_delta)
+                        # When tools are requested AND we haven't yet opened
+                        # a text block, drop pure-whitespace deltas. Models
+                        # often emit a leading newline around <tool_call>
+                        # envelopes that tool_filter passes through
+                        # (whitespace isn't part of the envelope markers).
+                        # Without this guard, the `\n` opens a text block
+                        # that then holds only whitespace — surfacing as
+                        # a phantom empty-ish text block before the
+                        # tool_use blocks.
+                        if (
+                            not text_block_started
+                            and kwargs.get("tools")
+                            and not content_delta.strip()
+                        ):
+                            pass  # drop leading whitespace adjacent to tool envelopes
+                        else:
+                            # Close thinking block if transitioning to text
+                            if thinking_block_started and not text_block_started:
+                                yield create_content_block_stop_event(index=block_index)
+                                block_index += 1
+                                thinking_block_started = False
+                            if not text_block_started:
+                                yield create_content_block_start_event(
+                                    index=block_index, block_type="text"
+                                )
+                                text_block_started = True
+                            yield create_text_delta_event(index=block_index, text=content_delta)
 
             if output.finished:
                 break
@@ -3199,19 +3274,8 @@ async def stream_anthropic_messages(
                 text_block_started = True
             yield create_text_delta_event(index=block_index, text=remaining)
 
-    # 4. Close open blocks
-    if thinking_block_started and not text_block_started:
-        # Only thinking was emitted, close it
-        yield create_content_block_stop_event(index=block_index)
-        block_index += 1
-    if text_block_started:
-        yield create_content_block_stop_event(index=block_index)
-    elif not thinking_block_started:
-        # No content at all - create empty text block
-        yield create_content_block_start_event(index=block_index, block_type="text")
-        yield create_content_block_stop_event(index=block_index)
-
-    # 5. Handle tool calls
+    # 5. Handle tool calls (moved before block-closing so empty-text-block
+    # emission can skip when tool_use blocks will follow).
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
@@ -3242,6 +3306,22 @@ async def stream_anthropic_messages(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
 
+    # 4. Close open blocks
+    if thinking_block_started and not text_block_started:
+        # Only thinking was emitted, close it
+        yield create_content_block_stop_event(index=block_index)
+        block_index += 1
+    if text_block_started:
+        yield create_content_block_stop_event(index=block_index)
+    elif not thinking_block_started and not tool_calls:
+        # No content AND no tool_calls — emit an empty text block so the
+        # message is well-formed. When tool_calls will follow, skip this —
+        # the tool_use blocks carry the semantic content, and an empty
+        # preceding text block confuses SDK clients that treat content[0]
+        # as authoritative.
+        yield create_content_block_start_event(index=block_index, block_type="text")
+        yield create_content_block_stop_event(index=block_index)
+
     # Reverse Gemma 4 parameter renaming
     if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
         for tc in tool_calls:
@@ -3254,7 +3334,14 @@ async def stream_anthropic_messages(
                     pass
 
     # Emit tool_use blocks if present
-    tool_block_start = block_index + 1
+    # When neither text nor thinking was streamed AND the empty-text-block
+    # emission was skipped (because tool_calls are about to follow), the
+    # tool_use block takes index 0. Otherwise it follows the last emitted
+    # text/thinking block at block_index+1.
+    if not text_block_started and not thinking_block_started:
+        tool_block_start = 0
+    else:
+        tool_block_start = block_index + 1
     if tool_calls:
         for i, tc in enumerate(tool_calls, start=tool_block_start):
             # Start tool_use block
@@ -3409,6 +3496,9 @@ async def create_anthropic_message(
     if extractor is not None:
         messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
 
+    # Detect and strip partial mode at the API boundary — exactly once.
+    is_partial = detect_and_strip_partial(messages)
+
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
@@ -3477,11 +3567,15 @@ async def create_anthropic_message(
     if merged_ct_kwargs:
         chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
+    # Forward partial-mode decision to the engine explicitly
+    chat_kwargs["is_partial"] = is_partial
+
     # Validate context window before sending to model
     try:
         num_prompt_tokens = engine.count_chat_tokens(
             messages, internal_tools,
             chat_template_kwargs=merged_ct_kwargs or None,
+            is_partial=is_partial,
         )
     except Exception as e:
         err_name = type(e).__name__.lower()

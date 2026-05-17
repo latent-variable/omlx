@@ -16,13 +16,14 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sys
 import time
 from collections import deque
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Literal
+from typing import Any, Literal
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -30,6 +31,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
+from ..model_profiles import EXCLUDED_FROM_PROFILES
+from ..settings import SubKeyEntry
+from ..utils.release_check import select_latest_stable_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -39,9 +43,6 @@ from .auth import (
     verify_api_key,
     verify_session,
 )
-from ..settings import SubKeyEntry
-from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..utils.release_check import select_latest_stable_release
 
 logger = logging.getLogger(__name__)
 
@@ -91,75 +92,83 @@ class CacheProbeRequest(BaseModel):
     """
 
     model_id: str
-    messages: List[Dict[str, Any]]
-    tools: Optional[List[Dict[str, Any]]] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = None
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]] | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
-    model_alias: Optional[str] = None
-    model_type_override: Optional[str] = None
-    max_context_window: Optional[int] = None
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    repetition_penalty: Optional[float] = None
-    min_p: Optional[float] = None
-    presence_penalty: Optional[float] = None
-    force_sampling: Optional[bool] = None
-    max_tool_result_tokens: Optional[int] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = None
-    forced_ct_kwargs: Optional[list[str]] = None
-    ttl_seconds: Optional[int] = None
-    index_cache_freq: Optional[int] = None
-    enable_thinking: Optional[bool] = None
-    thinking_budget_enabled: Optional[bool] = None
-    thinking_budget_tokens: Optional[int] = None
+    model_alias: str | None = None
+    model_type_override: str | None = None
+    max_context_window: int | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    force_sampling: bool | None = None
+    max_tool_result_tokens: int | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    forced_ct_kwargs: list[str] | None = None
+    ttl_seconds: int | None = None
+    index_cache_freq: int | None = None
+    enable_thinking: bool | None = None
+    thinking_budget_enabled: bool | None = None
+    thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
-    turboquant_kv_enabled: Optional[bool] = None
-    turboquant_kv_bits: Optional[float] = None
+    turboquant_kv_enabled: bool | None = None
+    turboquant_kv_bits: float | None = None
     # SpecPrefill (experimental)
-    specprefill_enabled: Optional[bool] = None
-    specprefill_draft_model: Optional[str] = None
-    specprefill_keep_pct: Optional[float] = None
-    specprefill_threshold: Optional[int] = None
+    specprefill_enabled: bool | None = None
+    specprefill_draft_model: str | None = None
+    specprefill_keep_pct: float | None = None
+    specprefill_threshold: int | None = None
     # DFlash (block diffusion speculative decoding)
-    dflash_enabled: Optional[bool] = None
-    dflash_draft_model: Optional[str] = None
-    dflash_draft_quant_bits: Optional[int] = None
-    dflash_max_ctx: Optional[int] = None
-    dflash_in_memory_cache: Optional[bool] = None
-    dflash_in_memory_cache_max_bytes: Optional[int] = None
-    dflash_ssd_cache: Optional[bool] = None
+    dflash_enabled: bool | None = None
+    dflash_draft_model: str | None = None
+    dflash_draft_quant_enabled: bool | None = None
+    dflash_draft_quant_weight_bits: int | None = None
+    dflash_draft_quant_activation_bits: int | None = None
+    dflash_draft_quant_group_size: int | None = None
+    dflash_max_ctx: int | None = None
+    dflash_in_memory_cache: bool | None = None
+    dflash_in_memory_cache_max_entries: int | None = None
+    dflash_in_memory_cache_max_bytes: int | None = None
+    dflash_ssd_cache: bool | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
-    mtp_enabled: Optional[bool] = None
-    reasoning_parser: Optional[str] = None
-    is_pinned: Optional[bool] = None
-    is_default: Optional[bool] = None
+    mtp_enabled: bool | None = None
+    # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
+    vlm_mtp_enabled: bool | None = None
+    vlm_mtp_draft_model: str | None = None
+    vlm_mtp_draft_block_size: int | None = None
+    reasoning_parser: str | None = None
+    is_pinned: bool | None = None
+    is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
-    trust_remote_code: Optional[bool] = None
+    trust_remote_code: bool | None = None
 
 
 class CreateProfileRequest(BaseModel):
     """Request body for creating a per-model profile."""
     name: str
     display_name: str
-    description: Optional[str] = None
-    settings: Dict[str, Any] = Field(default_factory=dict)
+    description: str | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
     also_save_as_template: bool = False
-    source_template: Optional[str] = None
+    source_template: str | None = None
 
 
 class UpdateProfileRequest(BaseModel):
     """Request body for updating/renaming a per-model profile."""
-    new_name: Optional[str] = None
-    display_name: Optional[str] = None
-    description: Optional[str] = None
-    settings: Optional[Dict[str, Any]] = None
-    source_template: Optional[str] = None
+    new_name: str | None = None
+    display_name: str | None = None
+    description: str | None = None
+    settings: dict[str, Any] | None = None
+    source_template: str | None = None
     also_save_as_template: bool = False
 
 
@@ -167,96 +176,99 @@ class CreateTemplateRequest(BaseModel):
     """Request body for creating a global template."""
     name: str
     display_name: str
-    description: Optional[str] = None
-    settings: Dict[str, Any] = Field(default_factory=dict)
+    description: str | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class UpdateTemplateRequest(BaseModel):
     """Request body for updating/renaming a global template."""
-    new_name: Optional[str] = None
-    display_name: Optional[str] = None
-    description: Optional[str] = None
-    settings: Optional[Dict[str, Any]] = None
+    new_name: str | None = None
+    display_name: str | None = None
+    description: str | None = None
+    settings: dict[str, Any] | None = None
 
 
 class GlobalSettingsRequest(BaseModel):
     """Request model for updating global server settings."""
 
     # Server settings
-    host: Optional[str] = None
-    port: Optional[int] = None
-    log_level: Optional[str] = None
-    server_aliases: Optional[List[str]] = None
-    sse_keepalive_mode: Optional[str] = None
+    host: str | None = None
+    port: int | None = None
+    log_level: str | None = None
+    server_aliases: list[str] | None = None
+    sse_keepalive_mode: str | None = None
 
     # Model settings
-    model_dirs: Optional[List[str]] = None
-    model_dir: Optional[str] = None  # Deprecated: kept for backward compatibility
-    max_model_memory: Optional[str] = None
-    model_fallback: Optional[bool] = None
+    model_dirs: list[str] | None = None
+    model_dir: str | None = None  # Deprecated: kept for backward compatibility
+    max_model_memory: str | None = None
+    model_fallback: bool | None = None
 
     # Memory enforcement
-    max_process_memory: Optional[str] = None  # "auto", "disabled", or "XX%"
-    memory_prefill_memory_guard: Optional[bool] = None
+    max_process_memory: str | None = None  # "auto", "disabled", or "XX%"
+    memory_prefill_memory_guard: bool | None = None
 
     # Scheduler settings
-    max_concurrent_requests: Optional[int] = None
+    max_concurrent_requests: int | None = None
+    chunked_prefill: bool | None = None
 
     # Cache settings
-    cache_enabled: Optional[bool] = None
-    ssd_cache_dir: Optional[str] = None
-    ssd_cache_max_size: Optional[str] = None
-    hot_cache_only: Optional[bool] = None
-    hot_cache_max_size: Optional[str] = None  # "0" = disabled, "8GB", etc.
-    initial_cache_blocks: Optional[int] = None  # Starting blocks (requires restart)
+    cache_enabled: bool | None = None
+    ssd_cache_dir: str | None = None
+    ssd_cache_max_size: str | None = None
+    hot_cache_only: bool | None = None
+    hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
+    initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
     # MCP settings
-    mcp_config: Optional[str] = None
+    mcp_config: str | None = None
 
     # HuggingFace settings
-    hf_endpoint: Optional[str] = None
+    hf_endpoint: str | None = None
 
     # ModelScope settings
-    ms_endpoint: Optional[str] = None
+    ms_endpoint: str | None = None
 
     # Network settings
-    network_http_proxy: Optional[str] = None
-    network_https_proxy: Optional[str] = None
-    network_no_proxy: Optional[str] = None
-    network_ca_bundle: Optional[str] = None
+    network_http_proxy: str | None = None
+    network_https_proxy: str | None = None
+    network_no_proxy: str | None = None
+    network_ca_bundle: str | None = None
 
     # Sampling defaults
-    sampling_max_context_window: Optional[int] = None
-    sampling_max_tokens: Optional[int] = None
-    sampling_temperature: Optional[float] = None
-    sampling_top_p: Optional[float] = None
-    sampling_top_k: Optional[int] = None
-    sampling_repetition_penalty: Optional[float] = None
+    sampling_max_context_window: int | None = None
+    sampling_max_tokens: int | None = None
+    sampling_temperature: float | None = None
+    sampling_top_p: float | None = None
+    sampling_top_k: int | None = None
+    sampling_repetition_penalty: float | None = None
 
     # Claude Code settings
-    claude_code_context_scaling_enabled: Optional[bool] = None
-    claude_code_target_context_size: Optional[int] = None
-    claude_code_mode: Optional[str] = None
-    claude_code_opus_model: Optional[str] = None
-    claude_code_sonnet_model: Optional[str] = None
-    claude_code_haiku_model: Optional[str] = None
+    claude_code_context_scaling_enabled: bool | None = None
+    claude_code_target_context_size: int | None = None
+    claude_code_mode: str | None = None
+    claude_code_opus_model: str | None = None
+    claude_code_sonnet_model: str | None = None
+    claude_code_haiku_model: str | None = None
 
     # Other integrations settings
-    integrations_codex_model: Optional[str] = None
-    integrations_opencode_model: Optional[str] = None
-    integrations_openclaw_model: Optional[str] = None
-    integrations_pi_model: Optional[str] = None
-    integrations_openclaw_tools_profile: Optional[Literal["minimal", "coding", "messaging", "full"]] = None
+    integrations_copilot_model: str | None = None
+    integrations_codex_model: str | None = None
+    integrations_opencode_model: str | None = None
+    integrations_openclaw_model: str | None = None
+    integrations_hermes_model: str | None = None
+    integrations_pi_model: str | None = None
+    integrations_openclaw_tools_profile: Literal["minimal", "coding", "messaging", "full"] | None = None
 
     # UI settings
-    ui_language: Optional[str] = None
+    ui_language: str | None = None
 
     # Idle timeout settings. null disables the global fallback.
-    idle_timeout_seconds: Optional[int] = Field(default=None, ge=60)
+    idle_timeout_seconds: int | None = Field(default=None, ge=60)
 
     # Auth settings
-    api_key: Optional[str] = None
-    skip_api_key_verification: Optional[bool] = None
+    api_key: str | None = None
+    skip_api_key_verification: bool | None = None
 
 
 class HFDownloadRequest(BaseModel):
@@ -295,6 +307,7 @@ class OQStartRequest(BaseModel):
     text_only: bool = False
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
+    auto_proxy_sensitivity: bool = True
 
 
 class HFUploadRequest(BaseModel):
@@ -329,12 +342,48 @@ def _format_cache_size(size_bytes: int) -> str:
     return f"{mb:.0f}MB"
 
 
+_PAROQUANT_REASON = (
+    "Not supported on paroquant models yet (compatibility not verified)"
+)
+
+
+def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
+    """Detect whether a model is paroquant-quantized.
+
+    Returns ``(is_paroquant, reason)``. ``is_paroquant`` is True iff
+    ``config.json`` declares ``quantization_config.quant_method == "paroquant"``.
+    Reason is the user-facing string surfaced as a tooltip/banner on the
+    admin model settings modal when paroquant gates an experimental toggle.
+    """
+    import json
+    from pathlib import Path
+
+    model_path = model_info.get("model_path") or ""
+    if not model_path:
+        return False, ""
+    cfg_path = Path(model_path) / "config.json"
+    if not cfg_path.exists():
+        return False, ""
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception:
+        return False, ""
+    qcfg = cfg.get("quantization_config") or {}
+    method = (qcfg.get("quant_method") or "").lower()
+    if method == "paroquant":
+        return True, _PAROQUANT_REASON
+    return False, ""
+
+
 def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     """Resolve dflash compatibility for an engine_pool model dict.
 
     Returns ``(False, "")`` when dflash-mlx is not installed so the UI hides
     the compat hint instead of pointing the user at an unrelated reason.
     """
+    is_paro, paro_reason = _paroquant_compat_for_model(model_info)
+    if is_paro:
+        return False, paro_reason
     try:
         from ..engine.dflash import is_dflash_compatible
     except ImportError:
@@ -360,6 +409,10 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     from pathlib import Path
 
     from ..utils.model_loading import _has_mtp_heads, _is_mtp_compatible
+
+    is_paro, paro_reason = _paroquant_compat_for_model(model_info)
+    if is_paro:
+        return False, paro_reason
 
     model_path = model_info.get("model_path") or ""
     if not model_path:
@@ -481,6 +534,7 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
         Tuple of (success, message)
     """
     from pathlib import Path
+
     from ..server import _server_state
 
     if _server_state.engine_pool is None:
@@ -592,8 +646,8 @@ async def _apply_max_model_memory_runtime(
     Returns:
         Tuple of (success, message)
     """
-    from ..server import _server_state
     from ..model_discovery import format_size
+    from ..server import _server_state
 
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
@@ -694,11 +748,11 @@ async def _apply_max_process_memory_runtime(
 
 
 async def _apply_cache_settings_runtime(
-    enabled: Optional[bool],
-    ssd_cache_dir: Optional[str],
-    ssd_cache_max_size: Optional[str],
+    enabled: bool | None,
+    ssd_cache_dir: str | None,
+    ssd_cache_max_size: str | None,
     global_settings,
-    hot_cache_max_size: Optional[str] = None,
+    hot_cache_max_size: str | None = None,
 ) -> tuple[bool, str]:
     """
     Apply cache settings at runtime.
@@ -709,8 +763,8 @@ async def _apply_cache_settings_runtime(
     Returns:
         Tuple of (success, message)
     """
-    from ..server import _server_state
     from ..config import parse_size
+    from ..server import _server_state
 
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
@@ -778,12 +832,12 @@ async def _apply_cache_settings_runtime(
 
 
 def _apply_sampling_settings_runtime(
-    max_context_window: Optional[int],
-    max_tokens: Optional[int],
-    temperature: Optional[float],
-    top_p: Optional[float],
-    top_k: Optional[int],
-    repetition_penalty: Optional[float] = None,
+    max_context_window: int | None,
+    max_tokens: int | None,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None,
+    repetition_penalty: float | None = None,
 ) -> tuple[bool, str]:
     """
     Apply sampling default settings at runtime.
@@ -847,6 +901,7 @@ def _static_version(path: str) -> str:
 templates.env.globals["static"] = _static_version
 
 from omlx._version import __version__ as _omlx_version
+
 templates.env.globals["version"] = _omlx_version
 
 # i18n defaults (English) — overridden once set_admin_getters is called
@@ -1380,7 +1435,7 @@ async def create_sub_key(
     entry = SubKeyEntry(
         key=request.key,
         name=request.name or "",
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
     )
     global_settings.auth.sub_keys.append(entry)
 
@@ -1443,7 +1498,7 @@ _SUPPORTED_MODELS_DOC_RE = re.compile(
 )
 
 
-def _models_from_docstring(fn) -> List[str]:
+def _models_from_docstring(fn) -> list[str]:
     """Extract the ``Supported models:`` bullet list from an xgrammar 0.1.34+
     structural-tag function's docstring. Returns ``[]`` if the section is
     absent or unparseable."""
@@ -1547,6 +1602,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         model_id = model_info["id"]
         settings = all_settings.get(model_id)
 
+        is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
 
@@ -1570,52 +1626,13 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "is_paroquant": is_paroquant,
+            "paroquant_reason": paroquant_reason,
         }
 
         # Add settings if available
         if settings:
-            model_data["settings"] = {
-                "model_alias": settings.model_alias,
-                "model_type_override": settings.model_type_override,
-                "max_context_window": settings.max_context_window,
-                "max_tokens": settings.max_tokens,
-                "temperature": settings.temperature,
-                "top_p": settings.top_p,
-                "top_k": settings.top_k,
-                "repetition_penalty": settings.repetition_penalty,
-                "min_p": settings.min_p,
-                "presence_penalty": settings.presence_penalty,
-                "force_sampling": settings.force_sampling,
-                "max_tool_result_tokens": settings.max_tool_result_tokens,
-                "enable_thinking": settings.enable_thinking,
-                "thinking_budget_enabled": settings.thinking_budget_enabled,
-                "thinking_budget_tokens": settings.thinking_budget_tokens,
-                "reasoning_parser": settings.reasoning_parser,
-                "chat_template_kwargs": settings.chat_template_kwargs,
-                "forced_ct_kwargs": settings.forced_ct_kwargs,
-                "ttl_seconds": settings.ttl_seconds,
-                "index_cache_freq": settings.index_cache_freq,
-                "turboquant_kv_enabled": settings.turboquant_kv_enabled,
-                "turboquant_kv_bits": settings.turboquant_kv_bits,
-                "specprefill_enabled": settings.specprefill_enabled,
-                "specprefill_draft_model": settings.specprefill_draft_model,
-                "specprefill_keep_pct": settings.specprefill_keep_pct,
-                "specprefill_threshold": settings.specprefill_threshold,
-                "dflash_enabled": settings.dflash_enabled,
-                "dflash_draft_model": settings.dflash_draft_model,
-                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
-                "dflash_max_ctx": settings.dflash_max_ctx,
-                "dflash_in_memory_cache": settings.dflash_in_memory_cache,
-                "dflash_in_memory_cache_max_bytes": settings.dflash_in_memory_cache_max_bytes,
-                "dflash_ssd_cache": settings.dflash_ssd_cache,
-                "mtp_enabled": settings.mtp_enabled,
-                "is_pinned": settings.is_pinned,
-                "is_default": settings.is_default,
-                "trust_remote_code": settings.trust_remote_code,
-                "display_name": settings.display_name,
-                "description": settings.description,
-                "active_profile_name": settings.active_profile_name,
-            }
+            model_data["settings"] = asdict(settings)
 
         models.append(model_data)
 
@@ -1745,7 +1762,6 @@ async def update_model_settings(
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
     # Get current settings
-    from ..model_settings import ModelSettings
     current_settings = settings_manager.get_settings(model_id)
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
@@ -1873,14 +1889,25 @@ async def update_model_settings(
         current_settings.dflash_enabled = new_dflash_enabled
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
-    if "dflash_draft_quant_bits" in sent:
-        current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
+    if "dflash_draft_quant_enabled" in sent:
+        current_settings.dflash_draft_quant_enabled = bool(request.dflash_draft_quant_enabled) if request.dflash_draft_quant_enabled is not None else None
+    if "dflash_draft_quant_weight_bits" in sent:
+        current_settings.dflash_draft_quant_weight_bits = int(request.dflash_draft_quant_weight_bits) if request.dflash_draft_quant_weight_bits is not None else None
+    if "dflash_draft_quant_activation_bits" in sent:
+        current_settings.dflash_draft_quant_activation_bits = int(request.dflash_draft_quant_activation_bits) if request.dflash_draft_quant_activation_bits is not None else None
+    if "dflash_draft_quant_group_size" in sent:
+        current_settings.dflash_draft_quant_group_size = int(request.dflash_draft_quant_group_size) if request.dflash_draft_quant_group_size is not None else None
     if "dflash_max_ctx" in sent:
         # 0/None means "unlimited" — the engine treats None as no fallback threshold
         value = request.dflash_max_ctx
         current_settings.dflash_max_ctx = value if value and value > 0 else None
     if "dflash_in_memory_cache" in sent:
         current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
+    if "dflash_in_memory_cache_max_entries" in sent:
+        value = request.dflash_in_memory_cache_max_entries
+        current_settings.dflash_in_memory_cache_max_entries = (
+            int(value) if value and value > 0 else 4
+        )
     if "dflash_in_memory_cache_max_bytes" in sent and request.dflash_in_memory_cache_max_bytes:
         current_settings.dflash_in_memory_cache_max_bytes = int(
             request.dflash_in_memory_cache_max_bytes
@@ -1922,9 +1949,10 @@ async def update_model_settings(
             # files must actually contain mtp.* tensors. The last check is
             # the one that catches mlx-community converted weights where the
             # default sanitize path stripped the MTP heads.
-            from ..utils.model_loading import _is_mtp_compatible
             import json
             from pathlib import Path
+
+            from ..utils.model_loading import _is_mtp_compatible
 
             cfg_path = Path(entry.model_path) / "config.json"
             if not cfg_path.exists():
@@ -1985,6 +2013,51 @@ async def update_model_settings(
                     detail="MTP and TurboQuant KV cannot both be enabled; TurboQuant patches the attention path MTP relies on.",
                 )
         current_settings.mtp_enabled = new_mtp_enabled
+
+    # VLM MTP (mlx-vlm f96138e+, gemma4_assistant drafter)
+    if "vlm_mtp_enabled" in sent:
+        new_vlm_mtp = bool(request.vlm_mtp_enabled)
+        if new_vlm_mtp:
+            drafter_after = (
+                request.vlm_mtp_draft_model
+                if "vlm_mtp_draft_model" in sent
+                else current_settings.vlm_mtp_draft_model
+            )
+            if not drafter_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "vlm_mtp_enabled requires vlm_mtp_draft_model "
+                        "(path to a gemma4_assistant drafter, "
+                        "e.g. 'gemma-4-26B-A4B-it-assistant')."
+                    ),
+                )
+            # Mutex enforced again at ModelSettings.__post_init__ for
+            # last-mile safety, but surface a clearer error here.
+            for other_field, other_label in (
+                ("dflash_enabled", "DFlash"),
+                ("specprefill_enabled", "SpecPrefill"),
+                ("mtp_enabled", "MTP"),
+                ("turboquant_kv_enabled", "TurboQuant KV"),
+            ):
+                other_after = (
+                    bool(getattr(request, other_field))
+                    if other_field in sent
+                    else getattr(current_settings, other_field)
+                )
+                if other_after:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"vlm_mtp_enabled and {other_label} cannot both be "
+                            "enabled; choose one speculative-decoding path."
+                        ),
+                    )
+        current_settings.vlm_mtp_enabled = new_vlm_mtp
+    if "vlm_mtp_draft_model" in sent:
+        current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
+    if "vlm_mtp_draft_block_size" in sent:
+        current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -2055,9 +2128,13 @@ async def update_model_settings(
             or "index_cache_freq" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
-            or "dflash_draft_quant_bits" in sent
+            or "dflash_draft_quant_enabled" in sent
+            or "dflash_draft_quant_weight_bits" in sent
+            or "dflash_draft_quant_activation_bits" in sent
+            or "dflash_draft_quant_group_size" in sent
             or "dflash_max_ctx" in sent
             or "dflash_in_memory_cache" in sent
+            or "dflash_in_memory_cache_max_entries" in sent
             or "dflash_in_memory_cache_max_bytes" in sent
             or "dflash_ssd_cache" in sent
             # trust_remote_code is plumbed at model load time; toggling it on
@@ -2237,8 +2314,8 @@ async def apply_model_profile(
 @router.get("/api/profile-fields")
 async def get_profile_fields(is_admin: bool = Depends(require_admin)):
     from ..model_profiles import (
-        UNIVERSAL_PROFILE_FIELDS,
         MODEL_SPECIFIC_PROFILE_FIELDS,
+        UNIVERSAL_PROFILE_FIELDS,
     )
 
     return {
@@ -2381,7 +2458,7 @@ async def get_generation_config(
     gen_config_path = model_path / "generation_config.json"
     if gen_config_path.exists():
         try:
-            with open(gen_config_path, "r", encoding="utf-8") as f:
+            with open(gen_config_path, encoding="utf-8") as f:
                 gen_config = json_module.load(f)
 
             # Temperature: if do_sample is false, effective temperature is 0
@@ -2405,7 +2482,7 @@ async def get_generation_config(
     config_path = model_path / "config.json"
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, encoding="utf-8") as f:
                 model_config = json_module.load(f)
 
             max_pos = (
@@ -2480,6 +2557,66 @@ async def get_server_info(is_admin: bool = Depends(require_admin)):
     }
 
 
+def _schedule_self_terminate(delay: float = 0.5) -> None:
+    """Schedule ``os.kill(getpid(), SIGTERM)`` on the running loop.
+
+    Extracted from the restart handler so tests can patch this seam
+    instead of mocking ``asyncio.get_running_loop`` globally (which
+    interferes with FastAPI's TestClient portal).
+    """
+    pid = os.getpid()
+
+    def _kill() -> None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # Already exited (e.g. concurrent SIGTERM) — nothing to do.
+            pass
+        except Exception:  # pragma: no cover — best-effort signal.
+            logger.exception("Failed to self-terminate for restart")
+
+    asyncio.get_running_loop().call_later(delay, _kill)
+
+
+@router.post("/api/server/restart")
+async def restart_server(is_admin: bool = Depends(require_admin)):
+    """Trigger a server restart via the menubar supervisor.
+
+    The handler does not perform the restart itself — it returns 202 and
+    schedules ``os.kill(os.getpid(), SIGTERM)`` 500ms after the response
+    is queued. The menubar app's ``ServerManager._health_check_loop``
+    detects the process exit and respawns the server with a short
+    backoff (~5s).
+
+    Gated by the ``OMLX_SUPERVISED`` environment variable so plain
+    ``omlx serve`` (no supervisor) returns 503 rather than killing the
+    server with no respawn path.
+    """
+    supervisor = os.environ.get("OMLX_SUPERVISED")
+    if not supervisor:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Server is not running under a supervisor that can "
+                "respawn it. Restart unavailable — use the menu bar "
+                "app's Restart, or restart from your shell."
+            ),
+        )
+
+    _schedule_self_terminate(0.5)
+    logger.warning("Server restart requested (supervisor=%s)", supervisor)
+
+    # 5s backoff in ServerManager + ~1-2s startup = ~7s downtime budget.
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "restarting",
+            "supervisor": supervisor,
+            "expected_downtime_seconds": 7,
+        },
+    )
+
+
 @router.get("/api/global-settings")
 async def get_global_settings(is_admin: bool = Depends(require_admin)):
     """
@@ -2531,6 +2668,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
+            "chunked_prefill": global_settings.scheduler.chunked_prefill,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -2584,7 +2722,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "codex_model": global_settings.integrations.codex_model,
             "opencode_model": global_settings.integrations.opencode_model,
             "openclaw_model": global_settings.integrations.openclaw_model,
+            "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
+            "copilot_model": global_settings.integrations.copilot_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
         },
         "system": {
@@ -2633,7 +2773,7 @@ async def update_global_settings(
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     # Track which settings were applied at runtime
-    runtime_applied: List[str] = []
+    runtime_applied: list[str] = []
 
     # Apply server settings
     if request.host is not None:
@@ -2761,6 +2901,26 @@ async def update_global_settings(
     if request.max_concurrent_requests is not None:
         global_settings.scheduler.max_concurrent_requests = (
             request.max_concurrent_requests
+        )
+
+    # Apply chunked prefill setting (Live)
+    if request.chunked_prefill is not None:
+        global_settings.scheduler.chunked_prefill = request.chunked_prefill
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            for mid, entry in pool._entries.items():
+                if entry is None or entry.engine is None:
+                    continue
+                async_core = getattr(entry.engine, "_engine", None)
+                core = getattr(async_core, "engine", None) if async_core is not None else None
+                scheduler = getattr(core, "scheduler", None) if core is not None else None
+                if scheduler is not None and hasattr(scheduler, "config"):
+                    scheduler.config.chunked_prefill = request.chunked_prefill
+        runtime_applied.append("chunked_prefill")
+        logger.info(
+            f"Chunked prefill {'enabled' if request.chunked_prefill else 'disabled'}"
         )
 
     # Apply cache settings
@@ -2949,6 +3109,9 @@ async def update_global_settings(
 
     # Apply integrations settings (Live - immediately applied)
     integrations_changed = False
+    if "integrations_copilot_model" in request.model_fields_set:
+        global_settings.integrations.copilot_model = request.integrations_copilot_model
+        integrations_changed = True
     if "integrations_codex_model" in request.model_fields_set:
         global_settings.integrations.codex_model = request.integrations_codex_model
         integrations_changed = True
@@ -2961,6 +3124,9 @@ async def update_global_settings(
         global_settings.integrations.openclaw_model = (
             request.integrations_openclaw_model
         )
+        integrations_changed = True
+    if "integrations_hermes_model" in request.model_fields_set:
+        global_settings.integrations.hermes_model = request.integrations_hermes_model
         integrations_changed = True
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
@@ -2975,9 +3141,11 @@ async def update_global_settings(
         runtime_applied.append("integrations")
         logger.info(
             f"Integration settings updated: "
+            f"copilot={global_settings.integrations.copilot_model}, "
             f"codex={global_settings.integrations.codex_model}, "
             f"opencode={global_settings.integrations.opencode_model}, "
             f"openclaw={global_settings.integrations.openclaw_model}, "
+            f"hermes={global_settings.integrations.hermes_model}, "
             f"pi={global_settings.integrations.pi_model}"
         )
 
@@ -3062,7 +3230,7 @@ def _tail_file(file_path: Path, num_lines: int) -> tuple[str, int]:
     lines = deque(maxlen=num_lines)
     total_lines = 0
 
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+    with open(file_path, encoding="utf-8", errors="replace") as f:
         for line in f:
             lines.append(line)
             total_lines += 1
@@ -3070,7 +3238,7 @@ def _tail_file(file_path: Path, num_lines: int) -> tuple[str, int]:
     return "".join(lines), total_lines
 
 
-def _get_available_log_files(log_dir: Path) -> List[str]:
+def _get_available_log_files(log_dir: Path) -> list[str]:
     """
     Get list of available log files sorted by modification time.
 
@@ -3097,7 +3265,7 @@ def _get_available_log_files(log_dir: Path) -> List[str]:
 @router.get("/api/logs")
 async def get_logs(
     lines: int = 100,
-    file: Optional[str] = None,
+    file: str | None = None,
     is_admin: bool = Depends(require_admin),
 ):
     """
@@ -3493,8 +3661,6 @@ async def get_server_stats(
     port = global_settings.server.port if global_settings else 8000
     api_key = global_settings.auth.api_key if global_settings else ""
 
-    from ..model_discovery import format_size
-    from ..prefill_progress import get_prefill_tracker
     from ..utils.install import get_cli_prefix
 
     # Build active_models data for the dashboard card.
@@ -3541,6 +3707,7 @@ def _build_active_models_data() -> dict:
             "total_waiting_requests": 0,
         }
 
+    now = time.monotonic()
     tracker = get_prefill_tracker()
     status = engine_pool.get_status()
     models = []
@@ -3554,6 +3721,10 @@ def _build_active_models_data() -> dict:
         model_id = model_info["id"]
         active_requests = 0
         waiting_requests = 0
+        running_by_id = {}
+        waiting_ids = set()
+        waiting = []
+        activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
@@ -3565,20 +3736,90 @@ def _build_active_models_data() -> dict:
                 core = getattr(async_core, "engine", None)
                 if core is not None:
                     collectors = getattr(core, "_output_collectors", {})
-                    active_request_ids = set(collectors.keys())
-                    active_requests = len(collectors)
+                    try:
+                        active_request_ids = set(collectors.keys())
+                        active_requests = len(collectors)
+                    except RuntimeError:
+                        # Scheduler state is mutated from the engine executor;
+                        # keep the dashboard endpoint best-effort rather than
+                        # failing on a concurrent dict resize.
+                        active_request_ids = set()
+                        active_requests = len(collectors)
+
                     sched = getattr(core, "scheduler", None)
-                    if sched is not None:
-                        waiting_requests = len(getattr(sched, "waiting", []))
+                    if sched is not None and hasattr(sched, "snapshot_for_admin"):
+                        snap = sched.snapshot_for_admin()
+                        running_by_id = snap["running_by_id"]
+                        waiting_queue = snap["waiting"]
+                        waiting_requests = len(waiting_queue)
+                        waiting_ids = {req.request_id for req in waiting_queue}
+                        waiting = [
+                            {
+                                "request_id": req.request_id,
+                                "queue_position": idx,
+                                "elapsed_seconds": max(0.0, now - req.arrival_time),
+                                "prompt_tokens": getattr(req, "num_prompt_tokens", 0),
+                            }
+                            for idx, req in enumerate(waiting_queue, start=1)
+                        ]
+            elif hasattr(entry.engine, "get_activity_snapshot"):
+                snapshot = entry.engine.get_activity_snapshot()
+                active_requests = snapshot.get("active_requests", 0)
+                activities = snapshot.get("activities", [])
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
 
-        # Generating = active requests that finished prefill
-        generating = [
-            {"request_id": rid}
-            for rid in sorted(active_request_ids - prefilling_ids)
-        ]
+        # Generating = active requests that finished prefill.
+        generating = []
+        for rid in sorted(active_request_ids - prefilling_ids - waiting_ids):
+            req = running_by_id.get(rid)
+            generated_tokens = getattr(req, "num_output_tokens", 0) if req else 0
+            started_at = getattr(req, "generation_started_at", None) if req else None
+            last_activity_at = getattr(req, "last_activity_at", None) if req else None
+            elapsed = max(0.0, now - started_at) if started_at else None
+            last_activity_age = (
+                max(0.0, now - last_activity_at) if last_activity_at else None
+            )
+            tokens_per_second = (
+                generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
+            )
+            generating.append(
+                {
+                    "request_id": rid,
+                    "elapsed_seconds": elapsed,
+                    "generated_tokens": generated_tokens,
+                    "tokens_per_second": tokens_per_second,
+                    "last_activity_age_seconds": last_activity_age,
+                    "prompt_tokens": getattr(req, "num_prompt_tokens", 0) if req else 0,
+                    "max_tokens": getattr(req, "max_tokens", None) if req else None,
+                }
+            )
+
+        loading_started_at = model_info.get("loading_started_at")
+        loading_elapsed_seconds = (
+            max(0.0, now - loading_started_at) if loading_started_at else None
+        )
+        loading_estimated_seconds = None
+        loading_remaining_seconds_estimate = None
+        if loading_elapsed_seconds is not None:
+            estimated_size_gb = model_info.get("estimated_size", 0) / (1024 ** 3)
+            # Model loaders do not expose byte-level progress, so use a
+            # deliberately conservative elapsed-time estimate and cap below
+            # complete until the model is actually loaded.
+            observed_seconds_per_gb = status.get("load_seconds_per_gb_estimate")
+            observations = status.get("load_time_observations", 0)
+            if observed_seconds_per_gb and observations >= 2:
+                # Adapt to this machine/session once we have more than a
+                # single potentially-misleading sample.
+                loading_estimated_seconds = max(
+                    3.0,
+                    1.0 + estimated_size_gb * float(observed_seconds_per_gb),
+                )
+                if loading_elapsed_seconds < loading_estimated_seconds:
+                    loading_remaining_seconds_estimate = max(
+                        0.0, loading_estimated_seconds - loading_elapsed_seconds
+                    )
 
         models.append({
             "id": model_id,
@@ -3588,8 +3829,13 @@ def _build_active_models_data() -> dict:
             ),
             "pinned": model_info.get("pinned", False),
             "is_loading": model_info.get("is_loading", False),
+            "loading_elapsed_seconds": loading_elapsed_seconds,
+            "loading_estimated_seconds": loading_estimated_seconds,
+            "loading_remaining_seconds_estimate": loading_remaining_seconds_estimate,
             "active_requests": active_requests,
             "waiting_requests": waiting_requests,
+            "waiting": waiting,
+            "activities": activities,
             "prefilling": prefilling,
             "generating": generating,
         })
@@ -3974,7 +4220,7 @@ async def get_recommended_models(
             max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
@@ -4005,7 +4251,7 @@ async def search_hf_models(
             mlx_only=mlx_only,
         )
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
@@ -4025,14 +4271,14 @@ async def get_hf_model_info(
             status_code=400, detail="Query parameter 'repo_id' is required"
         )
 
-    from .hf_downloader import HFDownloader
-
     from huggingface_hub.utils import RepositoryNotFoundError
+
+    from .hf_downloader import HFDownloader
 
     try:
         result = await HFDownloader.get_model_info(repo_id=repo_id.strip())
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
@@ -4189,6 +4435,20 @@ async def delete_hf_model(
         logger.error(f"Failed to delete model directory {model_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
 
+    # If the model was inside an org folder (organized layout) and that
+    # folder is now empty, drop it so the listing stays tidy.
+    parent = model_path.parent
+    if (
+        parent != parent_model_dir
+        and parent.exists()
+        and not any(parent.iterdir())
+    ):
+        try:
+            parent.rmdir()
+            logger.info(f"Removed empty org folder: {parent}")
+        except OSError as e:
+            logger.debug(f"Could not remove empty org folder {parent}: {e}")
+
     # Re-discover models
     if engine_pool is not None:
         settings_manager = _get_settings_manager()
@@ -4317,7 +4577,7 @@ async def get_ms_recommended_models(
             max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
         )
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="ModelScope API request timed out. The service may be temporarily unavailable.",
@@ -4348,7 +4608,7 @@ async def search_ms_models(
             mlx_only=mlx_only,
         )
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="ModelScope API request timed out. The service may be temporarily unavailable.",
@@ -4373,7 +4633,7 @@ async def get_ms_model_info(
     try:
         result = await MSDownloader.get_model_info(model_id=model_id.strip())
         return result
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status_code=504,
             detail="ModelScope API request timed out. The service may be temporarily unavailable.",
@@ -4525,7 +4785,7 @@ async def stream_accuracy_benchmark(
             while True:
                 try:
                     event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield ": keepalive\n\n"
                     continue
 
@@ -4633,7 +4893,7 @@ async def stream_benchmark(
             while True:
                 try:
                     event = await asyncio.wait_for(run.queue.get(), timeout=60.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Send keepalive
                     yield ": keepalive\n\n"
                     continue
@@ -4739,7 +4999,7 @@ async def get_device_info(
 # Update Check
 # =============================================================================
 
-_update_cache: Optional[Dict[str, Any]] = None
+_update_cache: dict[str, Any] | None = None
 _update_cache_time: float = 0.0
 _UPDATE_CACHE_TTL = 3600  # 1 hour
 
@@ -4868,6 +5128,15 @@ async def start_oq_quantization(
             status_code=400,
             detail="Invalid dtype. Must be 'bfloat16' or 'float16'",
         )
+    is_paro, _ = _paroquant_compat_for_model({"model_path": request.model_path})
+    if is_paro:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Model is already quantized with paroquant; "
+                "oQ re-quantization is not supported"
+            ),
+        )
     try:
         task = await _oq_manager.start_quantization(
             model_path=request.model_path,
@@ -4877,6 +5146,7 @@ async def start_oq_quantization(
             text_only=request.text_only,
             dtype=request.dtype,
             preserve_mtp=request.preserve_mtp,
+            auto_proxy_sensitivity=request.auto_proxy_sensitivity,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

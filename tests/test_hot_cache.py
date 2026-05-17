@@ -5,14 +5,15 @@ import threading
 import time
 from pathlib import Path
 from typing import List
+from unittest.mock import patch
 
 import pytest
 
 from omlx.cache.paged_ssd_cache import (
+    PagedSSDBlockMetadata,
     PagedSSDCacheManager,
     _extract_tensor_bytes,
 )
-
 
 try:
     import mlx.core as mx
@@ -493,6 +494,98 @@ class TestHotCacheConcurrency:
         assert len(errors) == 0, f"Concurrent errors: {errors}"
 
 
+class TestHotCacheByteAccounting:
+    """Regression tests for raw-byte hot cache size accounting."""
+
+    def _make_raw_entry(
+        self,
+        tmp_path: Path,
+        block_hash: bytes,
+        model_name: str = "test-model",
+        key_size: int = 128,
+        value_size: int = 256,
+    ):
+        metadata = PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=tmp_path / f"{block_hash.hex()}.safetensors",
+            file_size=key_size + value_size,
+            token_count=16,
+            created_at=time.time(),
+            last_access=time.time(),
+            num_layers=1,
+            model_name=model_name,
+            layer_cache_types=["KVCache"],
+        )
+        entry = {
+            "tensors_raw": {
+                "layer_0_keys": (bytes(key_size), "float32", [1, 1, 1, key_size // 4]),
+                "layer_0_values": (
+                    bytes(value_size),
+                    "float32",
+                    [1, 1, 1, value_size // 4],
+                ),
+            },
+            "file_metadata": {},
+            "num_layers": 1,
+            "layer_cache_types": ["KVCache"],
+            "block_metadata": metadata,
+        }
+        return entry, key_size + value_size
+
+    def test_hot_cache_remove_decrements_raw_entry_bytes(self, tmp_path):
+        """Removing a tensors_raw entry should subtract its bytes from the counter."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "remove_accounting",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=1024**2,
+            hot_cache_only=True,
+        )
+
+        try:
+            block_hash = b"remove_bytes_test"
+            entry, expected_size = self._make_raw_entry(tmp_path, block_hash)
+
+            mgr._hot_cache_put(block_hash, entry)
+            assert mgr._hot_cache_total_bytes == expected_size
+
+            mgr._hot_cache_remove(block_hash)
+
+            assert mgr._hot_cache_get(block_hash) is None
+            assert mgr._hot_cache_total_bytes == 0
+            assert mgr.get_stats().hot_cache_size_bytes == 0
+        finally:
+            mgr.close()
+
+    def test_get_stats_for_model_reports_raw_hot_cache_bytes(self, tmp_path):
+        """Per-model stats should count tensors_raw entries in the hot cache."""
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "model_accounting",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=1024**2,
+            hot_cache_only=True,
+        )
+
+        try:
+            model_a_hash = b"model_a_hot_bytes"
+            model_b_hash = b"model_b_hot_bytes"
+            model_a_entry, model_a_size = self._make_raw_entry(
+                tmp_path, model_a_hash, model_name="model-a"
+            )
+            model_b_entry, _ = self._make_raw_entry(
+                tmp_path, model_b_hash, model_name="model-b"
+            )
+
+            mgr._hot_cache_put(model_a_hash, model_a_entry)
+            mgr._hot_cache_put(model_b_hash, model_b_entry)
+
+            stats = mgr.get_stats_for_model("model-a")
+
+            assert stats.hot_cache_entries == 1
+            assert stats.hot_cache_size_bytes == model_a_size
+        finally:
+            mgr.close()
+
+
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestHotCacheStatsAccuracy:
     """Test that hot cache statistics are accurate."""
@@ -670,4 +763,46 @@ class TestHotCacheWriteBack:
         ssd_files = list((tmp_path / "wb_flush_test").rglob("*.safetensors"))
         assert len(ssd_files) == 3, (
             f"Expected 3 SSD files after flush, got {len(ssd_files)}"
+        )
+
+    def test_close_flushes_all_blocks_with_small_queue(self, tmp_path):
+        """close() must flush all hot cache blocks even when more blocks
+        exist than the write queue depth.
+
+        Regression test for #1070: put_nowait() in the shutdown flush loop
+        drops blocks when the bounded write queue fills up faster than the
+        writer thread can drain it.
+        """
+        queue_depth = 4
+        block_count = 12  # 3x the queue depth
+
+        with patch("omlx.cache.paged_ssd_cache._MAX_PENDING_WRITES", queue_depth):
+            mgr = PagedSSDCacheManager(
+                cache_dir=tmp_path / "wb_queue_full_test",
+                max_size_bytes=100 * 1024**2,
+                hot_cache_max_bytes=10 * 1024**2,
+            )
+
+        for i in range(block_count):
+            block_hash = f"wb_qfull_blk_{i:02d}".encode()
+            cache_data = self._make_cache_data()
+            mgr.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=16,
+                model_name="test",
+                layer_cache_types=["KVCache"] * 2,
+            )
+
+        # All blocks in hot cache, no SSD files yet
+        time.sleep(0.3)
+        ssd_files = list((tmp_path / "wb_queue_full_test").rglob("*.safetensors"))
+        assert len(ssd_files) == 0
+
+        mgr.close()
+
+        ssd_files = list((tmp_path / "wb_queue_full_test").rglob("*.safetensors"))
+        assert len(ssd_files) == block_count, (
+            f"Expected {block_count} SSD files after flush, got {len(ssd_files)}. "
+            f"Blocks were likely dropped due to write queue overflow during shutdown."
         )

@@ -20,6 +20,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
+from ..server_metrics import get_server_metrics
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,32 @@ def _resolve_model(model_id: str) -> str:
     from omlx.server import resolve_model_id
 
     return resolve_model_id(model_id) or model_id
+
+
+def _get_settings_manager():
+    """Return the active ModelSettingsManager from server state, or None.
+
+    Lazy import + defensive guard so the audio router stays usable in tests
+    that don't bring up the full server state.
+    """
+    try:
+        from omlx.server import _server_state
+    except Exception:
+        return None
+    return getattr(_server_state, "settings_manager", None)
+
+
+def _record_audio_request(model_id: str) -> None:
+    """Record audio request count without treating bytes/chars as tokens."""
+    try:
+        get_server_metrics().record_request_complete(
+            prompt_tokens=0,
+            completion_tokens=0,
+            cached_tokens=0,
+            model_id=model_id,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -349,26 +376,39 @@ async def create_transcription(
     language: Optional[str] = Form(None),
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
+    max_tokens: Optional[int] = Form(None),
+    word_timestamps: bool = Form(False),
 ):
     """OpenAI-compatible audio transcription endpoint (Speech-to-Text).
 
     Note: ``response_format`` and ``temperature`` are accepted for OpenAI API
     compatibility but are not yet implemented — they are silently ignored.
+
+    ``max_tokens`` is an oMLX extension that raises the underlying model's
+    output cap. Useful for long audio with models like VibeVoice-ASR whose
+    mlx-audio default (8192) truncates ~24 min files. When omitted, the
+    model's own default applies.
+
+    ``word_timestamps`` is an oMLX extension that exposes mlx-audio's native
+    word-level alignment for Whisper models. When True, each segment in the
+    response includes a ``words`` array of
+    ``{word, start, end, probability}`` objects. Default False preserves the
+    existing response shape for every current caller.
     """
     from omlx.engine.stt import STTEngine
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
-    model = _resolve_model(model)
+    resolved_model = _resolve_model(model)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(model)
+        engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{model}' not found. Available: {avail}",
+            detail=f"Model '{resolved_model}' not found. Available: {avail}",
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -376,7 +416,7 @@ async def create_transcription(
     if not isinstance(engine, STTEngine):
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{model}' is not a speech-to-text model",
+            detail=f"Model '{resolved_model}' is not a speech-to-text model",
         )
 
     # Save uploaded file to a temp path so the engine can open it by path.
@@ -392,7 +432,28 @@ async def create_transcription(
             tmp_path = tmp.name
             tmp.write(content)
 
-        result = await engine.transcribe(tmp_path, language=language)
+        # Effective max_tokens precedence: request > per-model setting (if any) >
+        # model's own ``generate(max_tokens=...)`` default. The per-model lookup
+        # mirrors how chat completions reads ModelSettings.max_tokens for LLMs;
+        # for STT, settings.json's ``max_tokens`` (e.g. raised to 65536 for
+        # VibeVoice-ASR) becomes the durable default for that model.
+        effective_max_tokens = max_tokens
+        if effective_max_tokens is None:
+            sm = _get_settings_manager()
+            if sm is not None:
+                try:
+                    ms = sm.get_settings(resolved_model)
+                    if ms is not None and getattr(ms, "max_tokens", None) is not None:
+                        effective_max_tokens = ms.max_tokens
+                except Exception:
+                    pass
+
+        transcribe_kwargs: dict = {"language": language}
+        if effective_max_tokens is not None:
+            transcribe_kwargs["max_tokens"] = effective_max_tokens
+        if word_timestamps:
+            transcribe_kwargs["word_timestamps"] = True
+        result = await engine.transcribe(tmp_path, **transcribe_kwargs)
     except HTTPException:
         raise
     except Exception as exc:
@@ -403,6 +464,8 @@ async def create_transcription(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    _record_audio_request(resolved_model)
 
     # Build response directly from the dict returned by STTEngine
     segments = result.get("segments") or None
@@ -500,6 +563,8 @@ async def create_speech(request: AudioSpeechRequest):
     finally:
         _cleanup_tempfile(ref_audio_path)
 
+    _record_audio_request(resolved_model)
+
     return Response(content=wav_bytes, media_type="audio/wav")
 
 
@@ -518,16 +583,16 @@ async def process_audio(
     from omlx.exceptions import ModelNotFoundError
 
     pool = _get_engine_pool()
-    model = _resolve_model(model)
+    resolved_model = _resolve_model(model)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
-        engine = await pool.get_engine(model)
+        engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{model}' not found. Available: {avail}",
+            detail=f"Model '{resolved_model}' not found. Available: {avail}",
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -535,7 +600,7 @@ async def process_audio(
     if not isinstance(engine, STSEngine):
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{model}' is not a speech-to-speech / audio processing model",
+            detail=f"Model '{resolved_model}' is not a speech-to-speech / audio processing model",
         )
 
     # Save uploaded file to a temp path so the engine can open it by path.
@@ -562,5 +627,7 @@ async def process_audio(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    _record_audio_request(resolved_model)
 
     return Response(content=wav_bytes, media_type="audio/wav")

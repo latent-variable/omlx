@@ -41,7 +41,7 @@
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
                 claude_code: { context_scaling_enabled: false, target_context_size: 200000, mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
-                integrations: { codex_model: null, opencode_model: null, openclaw_model: null, pi_model: null, openclaw_tools_profile: 'full' },
+                integrations: { copilot_model: null, codex_model: null, opencode_model: null, openclaw_model: null, hermes_model: null, pi_model: null, openclaw_tools_profile: 'full' },
                 ui: { language: 'en' },
                 idle_timeout: { idle_timeout_seconds: null },
                 system: { total_memory_bytes: 0, total_memory: '', auto_model_memory: '', ssd_total_bytes: 0, ssd_total: '' },
@@ -174,6 +174,17 @@
             serverAliases: [],
             selectedAlias: '',
 
+            // Server-restart state machine (driven by Settings > Server > Restart).
+            // status transitions: idle → restarting → waiting → idle (success)
+            //                   |                   |
+            //                   |                   └─→ error (timeout / non-200)
+            //                   └─→ unsupported (no menubar supervisor)
+            //                   └─→ error (POST failed)
+            restartServer: {
+                status: 'idle',
+                message: '',
+            },
+
             statsScope: 'session',
             selectedStatsModel: '',
             showClearStatsConfirm: false,
@@ -193,6 +204,7 @@
             logAvailableFiles: ['server.log'],
             logTotalLines: 0,
             logLastUpdated: '',
+            logMinLevel: 'TRACE',
             _logRefreshTimer: null,
 
             // Models sub-tab state
@@ -1552,9 +1564,13 @@
                     specprefill_threshold: settings.specprefill_threshold || null,
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
-                    dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    dflash_draft_quant_enabled: settings.dflash_draft_quant_enabled || false,
+                    dflash_draft_quant_weight_bits: settings.dflash_draft_quant_weight_bits || 4,
+                    dflash_draft_quant_activation_bits: settings.dflash_draft_quant_activation_bits || 16,
+                    dflash_draft_quant_group_size: settings.dflash_draft_quant_group_size || 64,
                     dflash_max_ctx: settings.dflash_max_ctx ?? null,
                     dflash_in_memory_cache: settings.dflash_in_memory_cache !== false,
+                    dflash_in_memory_cache_max_entries: settings.dflash_in_memory_cache_max_entries || 4,
                     dflash_in_memory_cache_max_gib: settings.dflash_in_memory_cache_max_bytes
                         ? Math.round(settings.dflash_in_memory_cache_max_bytes / (1024 ** 3))
                         : 8,
@@ -1565,6 +1581,11 @@
                     mtp_enabled: settings.mtp_enabled || false,
                     mtp_compatible: model.mtp_compatible === true,
                     mtp_compatibility_reason: model.mtp_compatibility_reason || '',
+                    is_paroquant: model.is_paroquant === true,
+                    paroquant_reason: model.paroquant_reason || '',
+                    vlm_mtp_enabled: settings.vlm_mtp_enabled || false,
+                    vlm_mtp_draft_model: settings.vlm_mtp_draft_model || '',
+                    vlm_mtp_draft_block_size: settings.vlm_mtp_draft_block_size ?? null,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1643,8 +1664,15 @@
                                     : null,
                                 dflash_enabled: this.modelSettings.dflash_enabled,
                                 dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_bits)
+                                dflash_draft_quant_enabled: this.modelSettings.dflash_enabled && !!this.modelSettings.dflash_draft_quant_enabled,
+                                dflash_draft_quant_weight_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_weight_bits)
+                                    : null,
+                                dflash_draft_quant_activation_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_activation_bits)
+                                    : null,
+                                dflash_draft_quant_group_size: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
+                                    ? parseInt(this.modelSettings.dflash_draft_quant_group_size)
                                     : null,
                                 dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
                                     ? parseInt(this.modelSettings.dflash_max_ctx)
@@ -1652,6 +1680,9 @@
                                 dflash_in_memory_cache: this.modelSettings.dflash_enabled
                                     ? !!this.modelSettings.dflash_in_memory_cache
                                     : true,
+                                dflash_in_memory_cache_max_entries: this.modelSettings.dflash_enabled
+                                    ? (parseInt(this.modelSettings.dflash_in_memory_cache_max_entries) || 4)
+                                    : 4,
                                 dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
                                     ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
                                     : 8 * (1024 ** 3),
@@ -1660,6 +1691,14 @@
                                     && !!this.modelSettings.dflash_ssd_cache_available
                                     && !!this.modelSettings.dflash_ssd_cache,
                                 mtp_enabled: !!this.modelSettings.mtp_enabled,
+                                vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
+                                vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
+                                    ? (this.modelSettings.vlm_mtp_draft_model || null)
+                                    : null,
+                                vlm_mtp_draft_block_size: this.modelSettings.vlm_mtp_enabled
+                                    && this.modelSettings.vlm_mtp_draft_block_size
+                                    ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
+                                    : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
                             };
                         })()),
@@ -1728,9 +1767,13 @@
                         this.modelSettings.specprefill_threshold = null;
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
-                        this.modelSettings.dflash_draft_quant_bits = null;
+                        this.modelSettings.dflash_draft_quant_enabled = false;
+                        this.modelSettings.dflash_draft_quant_weight_bits = null;
+                        this.modelSettings.dflash_draft_quant_activation_bits = null;
+                        this.modelSettings.dflash_draft_quant_group_size = null;
                         this.modelSettings.dflash_max_ctx = null;
                         this.modelSettings.dflash_in_memory_cache = true;
+                        this.modelSettings.dflash_in_memory_cache_max_entries = 4;
                         this.modelSettings.dflash_in_memory_cache_max_gib = 8;
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.mtp_enabled = false;
@@ -1811,6 +1854,109 @@
                 }
             },
 
+            async restartServerStart() {
+                if (this.restartServer.status === 'restarting'
+                    || this.restartServer.status === 'waiting') {
+                    return;
+                }
+                if (!window.confirm(window.t('settings.server.restart_confirm'))) {
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'restarting',
+                    message: window.t('settings.server.restart_status_sending'),
+                };
+
+                let response;
+                try {
+                    response = await fetch('/admin/api/server/restart', { method: 'POST' });
+                } catch (err) {
+                    // Network errors mid-restart are expected if the server
+                    // dies before sending the 202; fall through to polling.
+                    this.restartServer = {
+                        status: 'waiting',
+                        message: window.t('settings.server.restart_status_waiting'),
+                    };
+                    this._restartServerPoll();
+                    return;
+                }
+
+                if (response.status === 503) {
+                    let msg = window.t('settings.server.restart_status_unavailable');
+                    try {
+                        const data = await response.json();
+                        if (data && data.detail) msg = data.detail;
+                    } catch (e) { /* ignore */ }
+                    this.restartServer = { status: 'unsupported', message: msg };
+                    return;
+                }
+
+                if (response.status === 401) {
+                    window.location.href = '/admin';
+                    return;
+                }
+
+                if (response.status !== 202) {
+                    this.restartServer = {
+                        status: 'error',
+                        message: window.t('settings.server.restart_status_unexpected')
+                            .replace('{status}', String(response.status)),
+                    };
+                    return;
+                }
+
+                this.restartServer = {
+                    status: 'waiting',
+                    message: window.t('settings.server.restart_status_waiting'),
+                };
+                this._restartServerPoll();
+            },
+
+            _restartServerPoll() {
+                const deadline = Date.now() + 60000;  // 60s max wait
+                let sawDownAt = 0;
+                const tick = async () => {
+                    if (Date.now() > deadline) {
+                        this.restartServer = {
+                            status: 'error',
+                            message: window.t('settings.server.restart_status_timeout'),
+                        };
+                        return;
+                    }
+                    let alive = false;
+                    try {
+                        const r = await fetch('/health', { cache: 'no-store' });
+                        alive = r.ok;
+                    } catch (e) {
+                        alive = false;
+                    }
+                    if (!alive) {
+                        // First time we see it down — record it. We require a
+                        // down-then-up transition before declaring success, so
+                        // a fast supervisor that hasn't killed the old process
+                        // yet doesn't trick us into "instant success".
+                        if (!sawDownAt) sawDownAt = Date.now();
+                        setTimeout(tick, 1000);
+                        return;
+                    }
+                    // Alive again. If we never observed the down state, the
+                    // restart hasn't actually fired yet — keep polling.
+                    if (!sawDownAt) {
+                        setTimeout(tick, 1000);
+                        return;
+                    }
+                    this.restartServer = {
+                        status: 'idle',
+                        message: window.t('settings.server.restart_status_back'),
+                    };
+                    // Small delay so the user sees the success state, then
+                    // reload to ensure all caches/sessions re-sync.
+                    setTimeout(() => window.location.reload(), 500);
+                };
+                tick();
+            },
+
             get llmModels() {
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
@@ -1887,6 +2033,10 @@
                 return this._launchCmd('codex');
             },
 
+            get copilotCommand() {
+                return this._launchCmd('copilot');
+            },
+
             get opencodeCommand() {
                 return this._launchCmd('opencode');
             },
@@ -1894,6 +2044,10 @@
             get openclawCommand() {
                 const profile = this.globalSettings.integrations.openclaw_tools_profile || 'coding';
                 return `${this._launchCmd('openclaw')} --tools-profile ${profile}`;
+            },
+
+            get hermesCommand() {
+                return this._launchCmd('hermes');
             },
 
             get piCommand() {
@@ -1906,9 +2060,11 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
+                            integrations_copilot_model: this.globalSettings.integrations.copilot_model,
                             integrations_codex_model: this.globalSettings.integrations.codex_model,
                             integrations_opencode_model: this.globalSettings.integrations.opencode_model,
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
+                            integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                         }),
@@ -2034,10 +2190,53 @@
                 return '0';
             },
 
+            formatByteCount(bytes) {
+                if (bytes == null || !Number.isFinite(bytes)) return '';
+                if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+                if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                return Math.max(0, Math.round(bytes)) + ' B';
+            },
+
             formatTokenCount(n) {
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
+            },
+
+            formatDurationShort(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '—';
+                if (seconds < 1) return seconds.toFixed(1) + 's';
+                if (seconds < 60) return Math.round(seconds) + 's';
+                const minutes = Math.floor(seconds / 60);
+                const rem = Math.round(seconds % 60);
+                if (minutes < 60) return minutes + 'm ' + rem + 's';
+                const hours = Math.floor(minutes / 60);
+                return hours + 'h ' + (minutes % 60) + 'm';
+            },
+
+            formatActivityAge(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '';
+                return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+            },
+
+            formatActivityMetadata(activity) {
+                const parts = [];
+                if (activity.input_count != null) parts.push(activity.input_count + ' inputs');
+                if (activity.document_count != null) parts.push(activity.document_count + ' docs');
+                if (activity.token_count != null) parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                if (activity.text_length != null) parts.push(activity.text_length + ' chars');
+                if (activity.chunk_count != null) parts.push(activity.chunk_count + ' chunks');
+                if (activity.output_bytes != null) parts.push(this.formatByteCount(activity.output_bytes));
+                if (activity.file_size_bytes != null && activity.file_size_bytes > 0) parts.push(this.formatByteCount(activity.file_size_bytes));
+                return parts.join(' · ');
+            },
+
+            activityDotClass(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return 'bg-green-400 animate-pulse';
+                if (seconds < 15) return 'bg-green-400 animate-pulse';
+                if (seconds < 30) return 'bg-amber-400 animate-pulse';
+                return 'bg-red-400';
             },
 
             get activeModelsMemoryPercent() {
@@ -2736,6 +2935,28 @@
             },
 
             // Log viewer functions
+            filteredLogContent() {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (minIdx <= 0) return this.logContent;
+                const levelRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - \S+ - (TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL) - /;
+                let visible = true;
+                return this.logContent.split('\n').filter(line => {
+                    const m = line.match(levelRe);
+                    if (m) visible = LEVELS.indexOf(m[1]) >= minIdx;
+                    return visible;
+                }).join('\n');
+            },
+
+            levelButtonClass(lvl) {
+                const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'];
+                const idx = LEVELS.indexOf(lvl);
+                const minIdx = LEVELS.indexOf(this.logMinLevel);
+                if (idx < minIdx) return 'bg-neutral-100 text-neutral-300';
+                if (idx === minIdx) return 'bg-neutral-900 text-white';
+                return 'bg-neutral-200 text-neutral-700';
+            },
+
             async loadLogs() {
                 this.logLoading = true;
                 this.logError = '';
@@ -2830,7 +3051,7 @@
                     return { auto: false, percent: Math.min(99, Math.max(1, percent)) };
                 }
                 // Handle percent format (e.g., "69%")
-                const percent = parseInt(value.replace('%', ''));
+                const percent = parseInt(value.replace(/%/g, ''));
                 if (isNaN(percent)) return { auto: false, percent: 90 };
                 return { auto: false, percent: Math.min(99, Math.max(0, percent)) };
             },

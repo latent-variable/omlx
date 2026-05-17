@@ -205,7 +205,10 @@ class BatchedEngine(BaseEngine):
 
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
-        from ..utils.model_loading import maybe_apply_pre_load_patches
+        from ..utils.model_loading import (
+            maybe_load_custom_quantization,
+            maybe_apply_pre_load_patches,
+        )
 
         # Build tokenizer config with model-specific fixes
         tokenizer_config = get_tokenizer_config(
@@ -226,6 +229,14 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_model_sync():
+            custom_loaded = maybe_load_custom_quantization(
+                self._model_name,
+                is_vlm=False,
+            )
+            if custom_loaded is not None:
+                model, processor = custom_loaded
+                return model, getattr(processor, "tokenizer", processor)
+
             return load(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
@@ -299,8 +310,21 @@ class BatchedEngine(BaseEngine):
                 try:
 
                     def _load_draft():
-                        draft_model, _ = load(specprefill_draft)
-                        return draft_model
+                        from ..patches.mlx_lm_mtp import set_mtp_active
+
+                        was_mtp = False
+                        try:
+                            from ..patches.mlx_lm_mtp import is_mtp_active
+
+                            was_mtp = is_mtp_active()
+                        except Exception:
+                            pass
+                        set_mtp_active(False)
+                        try:
+                            draft_model, _ = load(specprefill_draft)
+                            return draft_model
+                        finally:
+                            set_mtp_active(was_mtp)
 
                     draft_model = await loop.run_in_executor(
                         get_mlx_executor(), _load_draft
@@ -337,6 +361,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -345,9 +370,20 @@ class BatchedEngine(BaseEngine):
             tools: Optional tool definitions
             chat_template_kwargs: Optional kwargs passed to tokenizer.apply_chat_template
                 (e.g. enable_thinking, reasoning_effort). Overrides global _enable_thinking.
+            is_partial: Explicit partial-mode signal from the API server.
+                ``True``/``False`` — server has already decided; the ``partial``
+                key is cleaned from message dicts but no detection is performed.
+                ``None`` (default) — auto-detect from messages for backward
+                compatibility with direct engine callers.
         """
         if hasattr(self._tokenizer, "apply_chat_template"):
-            is_partial = detect_and_strip_partial(messages)
+            if is_partial is None:
+                is_partial = detect_and_strip_partial(messages)
+            else:
+                # Server already resolved partial; just clean residual keys
+                # so the chat template never sees the non-standard field.
+                for msg in messages:
+                    msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": not is_partial,
@@ -387,6 +423,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> int:
         """
         Count prompt tokens for chat messages after applying chat template.
@@ -395,6 +432,7 @@ class BatchedEngine(BaseEngine):
             messages: List of chat messages
             tools: Optional tool definitions
             chat_template_kwargs: Optional kwargs for chat template
+            is_partial: Explicit partial-mode signal (see _apply_chat_template).
 
         Returns:
             Number of prompt tokens
@@ -402,7 +440,9 @@ class BatchedEngine(BaseEngine):
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
-            messages, template_tools, chat_template_kwargs=chat_template_kwargs
+            messages, template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
         )
         return len(self._tokenizer.encode(prompt))
 
@@ -545,7 +585,8 @@ class BatchedEngine(BaseEngine):
                 "specprefill_system_end"
             )
 
-        request_id = await self._engine.add_request(
+        engine = self._engine
+        request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             **specprefill_kwargs,
@@ -553,7 +594,7 @@ class BatchedEngine(BaseEngine):
 
         finished_normally = False
         try:
-            async for output in self._engine.stream_outputs(request_id):
+            async for output in engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
                 # Set finished_normally BEFORE yield, because the consumer
@@ -584,7 +625,7 @@ class BatchedEngine(BaseEngine):
                 logger.info(
                     f"[stream_generate] Aborting request {request_id} (finished_normally={finished_normally})"
                 )
-                await self._engine.abort_request(request_id)
+                await engine.abort_request(request_id)
             else:
                 logger.debug(
                     f"[stream_generate] Request {request_id} finished normally"
@@ -632,8 +673,10 @@ class BatchedEngine(BaseEngine):
 
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        partial = kwargs.pop("is_partial", None)
         prompt = self._apply_chat_template(
-            messages, template_tools, chat_template_kwargs=ct_kwargs
+            messages, template_tools,
+            chat_template_kwargs=ct_kwargs, is_partial=partial,
         )
 
         return await self.generate(
@@ -690,8 +733,10 @@ class BatchedEngine(BaseEngine):
 
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
+        partial = kwargs.pop("is_partial", None)
         prompt = self._apply_chat_template(
-            messages, template_tools, chat_template_kwargs=ct_kwargs
+            messages, template_tools,
+            chat_template_kwargs=ct_kwargs, is_partial=partial,
         )
 
         # SpecPrefill: compute system prompt token count for protection.
