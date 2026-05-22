@@ -37,6 +37,7 @@ from mlx_lm.generate import (
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors
 
+from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .exceptions import is_cache_corruption_error
@@ -781,6 +782,7 @@ class Scheduler:
         self.paged_cache_manager: PagedCacheManager | None = None
         self.block_aware_cache: BlockAwarePrefixCache | None = None
         self.paged_ssd_cache_manager: PagedSSDCacheManager | None = None
+        self._cache_rate_tracker = CacheRateTracker()
         self.memory_monitor: MemoryMonitor | None = None
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
@@ -3291,6 +3293,7 @@ class Scheduler:
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
             if block_table and block_table.num_tokens > 0:
+                self.block_aware_cache.preload_blocks(block_table)
                 # Reconstruct actual KVCache objects from stored tensor data
                 # Note: reconstruct_cache may modify block_table in-place if
                 # partial reconstruction occurs (some blocks invalid)
@@ -3796,6 +3799,7 @@ class Scheduler:
                         request.request_id, tokens_to_score
                     )
                     if block_table and block_table.num_tokens > 0:
+                        self._draft_prefix_cache.preload_blocks(block_table)
                         reconstructed = self._draft_prefix_cache.reconstruct_cache(
                             block_table
                         )
@@ -4164,6 +4168,41 @@ class Scheduler:
                 req._extracted_cache = None
                 req.prompt_cache = None
         self.waiting.clear()
+        # Catch in-flight orphans: a request popped from self.waiting but
+        # not yet added to self.running (or self.prefilling) sits as a
+        # local in _schedule_waiting. If _do_external_prefill raises, the
+        # request is unreachable through the three queues but still lives
+        # in self.requests (and the engine_core collector / finished_event
+        # for its id is still waiting). Without this pass, fail_all_requests
+        # returns an incomplete list and the HTTP request hangs forever.
+        #
+        # Exclude finished requests still awaiting async cache-store cleanup
+        # (those have an entry in ``_inflight_store_futures`` — see
+        # ``_cleanup_finished`` line ~5267). They have already emitted a
+        # ``finished=True`` output to their collector; ``_drain_pending_async_removes``
+        # pops them from ``self.requests`` after the store future completes.
+        # Failing them here would append an error output that wins over the
+        # success for non-streaming ``generate()`` callers (engine_core
+        # returns the last queued output).
+        for request_id in list(self.requests):
+            if request_id in self._inflight_store_futures:
+                continue
+            failed_ids.append(request_id)
+            req = self.requests.pop(request_id, None)
+            if req is not None:
+                req._extracted_cache = None
+                req.prompt_cache = None
+        # Clear stale uid mappings for every failed id. Running requests hold
+        # real uids; the in-flight orphan above holds the temp_uid assigned at
+        # _schedule_waiting (id(request)) that its success-path cleanup never
+        # reached. batch_generator is reset below, so these mappings are dead
+        # either way. failed_ids excludes _inflight_store_futures ids, so the
+        # async-cleanup uids that _drain_pending_async_removes still needs are
+        # left intact.
+        for rid in failed_ids:
+            uid = self.request_id_to_uid.pop(rid, None)
+            if uid is not None:
+                self.uid_to_request_id.pop(uid, None)
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None
@@ -4217,7 +4256,7 @@ class Scheduler:
             return None
 
         peak = self.memory_monitor.estimate_prefill_peak_bytes(
-            new_tokens, self.config.prefill_step_size
+            new_tokens, self.config.prefill_step_size, cached_tokens=cached_tokens
         )
         if peak == 0:
             return None  # can't estimate, skip
@@ -5322,6 +5361,7 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self._cache_rate_tracker.clear()
 
         # Clear UID mappings
         self.request_id_to_uid.clear()
@@ -5651,6 +5691,7 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self._cache_rate_tracker.clear()
 
         # Clear detokenizers
         self._request_detokenizers.clear()
@@ -6083,6 +6124,35 @@ class Scheduler:
 
         return verified
 
+    def _collect_cache_counters(self) -> dict[str, int] | None:
+        if self.block_aware_cache is None:
+            return None
+
+        prefix_stats = self.block_aware_cache.get_stats()
+        counters = {
+            "prefix_hits": prefix_stats.hits,
+            "prefix_misses": prefix_stats.misses,
+            "prefix_tokens_matched": prefix_stats.tokens_matched_total,
+            "prefix_tokens_requested": prefix_stats.tokens_requested_total,
+            "prefix_tokens_saved": prefix_stats.tokens_saved,
+            "evictions": prefix_stats.evictions,
+        }
+
+        if self.paged_ssd_cache_manager is not None:
+            ssd = self.paged_ssd_cache_manager.get_stats()
+            hot_hits = ssd.hot_cache_hits
+            total_loads = ssd.loads
+            counters.update({
+                "ssd_hot_hits": hot_hits,
+                "ssd_disk_loads": max(0, total_loads - hot_hits),
+                "ssd_saves": ssd.saves,
+                "ssd_errors": ssd.errors,
+                "hot_cache_evictions": ssd.hot_cache_evictions,
+                "hot_cache_promotions": ssd.hot_cache_promotions,
+            })
+
+        return counters
+
     def get_ssd_cache_stats(self) -> dict[str, Any] | None:
         """Get paged SSD + prefix cache observability statistics."""
         stats = {}
@@ -6091,14 +6161,17 @@ class Scheduler:
             stats["ssd_cache"] = self.paged_ssd_cache_manager.get_stats()
 
         if self.paged_cache_manager is not None:
-            # In paged SSD-only mode, all cache data is on paged SSD
             stats["indexed_blocks"] = self.paged_cache_manager.cold_block_count
             stats["block_size"] = self.config.paged_cache_block_size
 
         if self.block_aware_cache is not None:
-            # Expose prefix-cache observability so UI can distinguish
-            # "0 indexed blocks" from "sub-block cached (<block_size)".
             stats["prefix_cache"] = self.block_aware_cache.get_stats_dict()
+
+        counters = self._collect_cache_counters()
+        if counters:
+            stats["cache_rates"] = self._cache_rate_tracker.snapshot_and_get_rates(
+                counters
+            )
 
         return stats if stats else None
 
