@@ -339,6 +339,7 @@ async def lifespan(app: FastAPI):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=_server_state.engine_pool,
             memory_guard_tier=memory_settings.memory_guard_tier,
+            memory_guard_custom_ceiling_gb=memory_settings.memory_guard_custom_ceiling_gb,
             settings_manager=_server_state.settings_manager,
             prefill_memory_guard=memory_settings.prefill_memory_guard,
             global_settings=_server_state.global_settings,
@@ -835,6 +836,8 @@ def get_sampling_params(
     req_temperature: float | None,
     req_top_p: float | None,
     model_id: str | None = None,
+    req_top_k: int | None = None,
+    req_repetition_penalty: float | None = None,
     req_min_p: float | None = None,
     req_presence_penalty: float | None = None,
     req_frequency_penalty: float | None = None,
@@ -908,13 +911,19 @@ def get_sampling_params(
         else:
             top_p = global_sampling.top_p
 
-        if model_settings and model_settings.top_k is not None:
+        if req_top_k is not None:
+            top_k = req_top_k
+        elif model_settings and model_settings.top_k is not None:
             top_k = model_settings.top_k
+        elif ocr_defaults and "top_k" in ocr_defaults:
+            top_k = ocr_defaults["top_k"]
         else:
             top_k = global_sampling.top_k
 
-    # Repetition penalty: model settings > ocr_defaults > global default (1.0)
-    if model_settings and model_settings.repetition_penalty is not None:
+    # Repetition penalty: request > model settings > ocr_defaults > global (1.0)
+    if req_repetition_penalty is not None:
+        repetition_penalty = req_repetition_penalty
+    elif model_settings and model_settings.repetition_penalty is not None:
         repetition_penalty = model_settings.repetition_penalty
     elif ocr_defaults and "repetition_penalty" in ocr_defaults:
         repetition_penalty = ocr_defaults["repetition_penalty"]
@@ -1356,6 +1365,26 @@ def _resolve_keepalive(protocol: str) -> Optional[str]:
     if protocol == "openai_responses":
         return None
     return None
+
+
+def _chat_keepalive_chunk(response_id: str) -> str:
+    """Keepalive frame that shares the stream's completion id.
+
+    The static ``_KEEPALIVE_CHAT_CHUNK`` carries a sentinel id
+    (``chatcmpl-keepalive``) that differs from the real completion chunks.
+    Strict OpenAI stream accumulators (e.g. the official ``openai-go`` SDK)
+    assume every chunk in one streamed completion shares a single ``id``: they
+    latch the first chunk's id and silently drop later chunks whose id differs,
+    discarding the real ``tool_calls``/``finish_reason``/``usage``. Emitting the
+    keepalive with the stream's own ``response_id`` makes it a true no-op for
+    those clients while remaining a parseable data event for clients that can't
+    handle SSE comment lines.
+    """
+    return (
+        'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
+        '"created":0,"model":"keepalive",'
+        '"choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n'
+    )
 
 
 async def _safe_anext(ait):
@@ -1995,6 +2024,8 @@ async def create_completion(
 
         temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
             request.temperature, request.top_p, request.model,
+            req_top_k=getattr(request, 'top_k', None),
+            req_repetition_penalty=getattr(request, 'repetition_penalty', None),
             req_min_p=getattr(request, 'min_p', None),
             req_presence_penalty=getattr(request, 'presence_penalty', None),
             req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -2224,6 +2255,8 @@ async def create_chat_completion(
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -2313,11 +2346,17 @@ async def create_chat_completion(
         chat_kwargs["stop"] = request.stop
 
     if request.stream:
+        # Pre-mint the completion id so the keepalive frame (emitted before the
+        # generator starts) can share it. See _chat_keepalive_chunk.
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        keepalive = _resolve_keepalive("openai_chat")
+        if keepalive == _KEEPALIVE_CHAT_CHUNK:
+            keepalive = _chat_keepalive_chunk(response_id)
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
+                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, response_id=response_id, **chat_kwargs),
                 http_request=http_request,
-                keepalive_chunk=_resolve_keepalive("openai_chat"),
+                keepalive_chunk=keepalive,
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -2667,6 +2706,8 @@ async def stream_completion(
 
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
@@ -2769,6 +2810,7 @@ async def stream_chat_completion(
     request: ChatCompletionRequest,
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
+    response_id: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -2784,7 +2826,9 @@ async def stream_chat_completion(
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
 
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    # Reuse the id pre-minted by the caller (so the keepalive frame can share
+    # it); otherwise mint one for direct/non-streaming callers.
+    response_id = response_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
@@ -3523,6 +3567,8 @@ async def create_anthropic_message(
     # Prepare kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
+        req_top_k=getattr(request, 'top_k', None),
+        req_repetition_penalty=getattr(request, 'repetition_penalty', None),
         req_max_tokens=request.max_tokens,
     )
 
@@ -3960,7 +4006,14 @@ async def create_response(
 
     # Build sampling kwargs
     temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
-        get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
+        get_sampling_params(
+            request.temperature,
+            request.top_p,
+            request.model,
+            req_top_k=getattr(request, 'top_k', None),
+            req_repetition_penalty=getattr(request, 'repetition_penalty', None),
+            req_max_tokens=request.max_output_tokens,
+        )
     )
     chat_kwargs = {
         "max_tokens": max_tokens,

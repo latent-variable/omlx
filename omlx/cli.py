@@ -18,6 +18,8 @@ import argparse
 import faulthandler
 import sys
 
+from ._version import __version__
+
 
 def _has_cli_overrides(args) -> bool:
     """Check if CLI args contain non-default values that should be saved.
@@ -32,6 +34,8 @@ def _has_cli_overrides(args) -> bool:
     if hasattr(args, "host") and args.host is not None:
         return True
     if hasattr(args, "log_level") and args.log_level is not None:
+        return True
+    if hasattr(args, "embedding_batch_size") and args.embedding_batch_size is not None:
         return True
     if hasattr(args, "mcp_config") and args.mcp_config is not None:
         return True
@@ -128,6 +132,14 @@ def serve_command(args):
         os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
         os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
 
+    # Validate before persisting CLI overrides, so invalid flags never poison
+    # settings.json.
+    errors = settings.validate()
+    if errors:
+        for error in errors:
+            print(f"Configuration error: {error}")
+        sys.exit(1)
+
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
         try:
@@ -152,13 +164,6 @@ def serve_command(args):
     crash_log_path = log_dir / "crash.log"
     _crash_file = open(crash_log_path, "a")
     faulthandler.enable(file=_crash_file, all_threads=True)
-
-    # Validate settings
-    errors = settings.validate()
-    if errors:
-        for error in errors:
-            print(f"Configuration error: {error}")
-        sys.exit(1)
 
     # Import server and config
     from .server import app, init_server
@@ -409,14 +414,14 @@ def diagnose_menubar() -> int:
 
     mac_ver = platform.mac_ver()[0] or "unknown"
     print(f"macOS:          {mac_ver}")
-    print(f"Bundle ID:      com.omlx.app")
+    print(f"Bundle ID:      app.omlx")
 
     app_path = Path("/Applications/oMLX.app")
     print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")
 
     try:
         res = subprocess.run(
-            ["pgrep", "-af", "omlx_app"],
+            ["pgrep", "-af", "oMLX"],
             capture_output=True, text=True, timeout=5,
         )
         running = bool(res.stdout.strip())
@@ -428,10 +433,11 @@ def diagnose_menubar() -> int:
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         print(f"Menubar app:    check failed ({e})")
 
+    # The Swift app writes `server.log` (stdout/stderr of the Python child).
+    # No separate menubar.log — visibility-probe lines are logged into the
+    # same file via OSLog.
     log_dir = Path.home() / "Library" / "Application Support" / "oMLX" / "logs"
-    # menubar.log captures the visibility probe (frame + isVisible);
-    # server.log may carry fallback warnings for older builds.
-    log_candidates = [log_dir / "menubar.log", log_dir / "server.log"]
+    log_candidates = [log_dir / "server.log"]
     print(f"Log dir:        {log_dir}")
 
     hits: list[tuple[str, str]] = []
@@ -468,7 +474,7 @@ def diagnose_menubar() -> int:
     print("  1. Open System Settings > Menu Bar")
     print("     open 'x-apple.systempreferences:com.apple.ControlCenter-Settings.extension?MenuBar'")
     print("  2. Find 'oMLX' and set it to 'Show in Menu Bar'")
-    print("  3. If oMLX isn't in the list, quit the menubar app and relaunch oMLX.app")
+    print("  3. If oMLX isn't in the list, quit the app and relaunch oMLX.app")
     print()
     print("Note: Apple's sandbox policy prevents third-party apps from")
     print("programmatically re-enabling their own menubar visibility on Tahoe.")
@@ -494,6 +500,12 @@ Examples:
   omlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
   omlx launch codex --model qwen3.5
         """,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=__version__,
+        help="Print the oMLX version and exit",
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
@@ -552,6 +564,12 @@ Example directory structure:
         type=int,
         default=None,
         help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
+    )
+    serve_parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=None,
+        help="Max embedding inputs processed in one forward pass. Higher values increase throughput but use more memory. (default: 32)",
     )
 
     # paged SSD cache options
