@@ -12,17 +12,45 @@ Tests cover:
 - get_request(): request lookup
 - get_stats(): statistics
 
-Note: BatchGenerator is mocked; step() is too complex for unit tests.
+Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 """
 
 from collections import deque
-from unittest.mock import MagicMock, patch, PropertyMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
 
+import omlx.scheduler as scheduler_module
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput, SchedulingPolicy
+
+
+class _ParserStopFactory:
+    kind = "test"
+    stop_token_ids = set()
+    thinking_end_text = None
+
+    def create_session(self, tokenizer):
+        return _ParserStopSession()
+
+
+class _ParserStopSession:
+    def process_token(self, token_id):
+        from omlx.adapter.output_parser import OutputParserTokenResult
+
+        return OutputParserTokenResult(
+            stream_text="",
+            visible_text="",
+            is_stop=True,
+            record_token=False,
+        )
+
+    def finalize(self):
+        from omlx.adapter.output_parser import OutputParserFinalizeResult
+
+        return OutputParserFinalizeResult()
 
 
 class TestSchedulerConfig:
@@ -132,6 +160,44 @@ class TestSchedulerOutput:
         assert output.has_work is True
 
 
+class TestSchedulerStepOutputs:
+    """Tests for Scheduler.step output assembly."""
+
+    def test_decode_outputs_preserve_prefill_rejections(
+        self, mock_model, mock_tokenizer
+    ):
+        """Decode responses must not overwrite earlier rejection outputs."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        prefill_error = RequestOutput(
+            request_id="prefill-failed",
+            finished=True,
+            finish_reason="error",
+            error="Memory limit exceeded during prefill",
+        )
+        decode_output = RequestOutput(
+            request_id="running",
+            new_token_ids=[123],
+            new_text="x",
+        )
+
+        scheduler._schedule_waiting = MagicMock(return_value=([], [prefill_error]))
+        scheduler._process_batch_responses = MagicMock(
+            return_value=([decode_output], {"running"})
+        )
+        scheduler._cleanup_finished = MagicMock()
+
+        scheduler.running = {"running": MagicMock()}
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = iter([MagicMock()])
+
+        output = scheduler.step()
+
+        assert output.outputs == [prefill_error, decode_output]
+        assert output.finished_request_ids == {"running"}
+        scheduler._cleanup_finished.assert_called_once_with({"running"})
+
+
 class TestSchedulerInitialization:
     """Tests for Scheduler initialization."""
 
@@ -165,6 +231,35 @@ class TestSchedulerInitialization:
         )
 
         assert scheduler.config.max_num_seqs == 64
+
+    def test_init_falls_back_when_paged_ssd_cache_unavailable(
+        self, mock_model, mock_tokenizer, tmp_path, monkeypatch, caplog
+    ):
+        """Unusable SSD cache directories should not leave partial cache state."""
+        if not scheduler_module.HAS_TIERED_CACHE:
+            pytest.skip("tiered cache modules are unavailable")
+
+        class BrokenPagedSSDCacheManager:
+            def __init__(self, *args, **kwargs):
+                raise OSError("cache directory is not writable")
+
+        monkeypatch.setattr(
+            scheduler_module,
+            "PagedSSDCacheManager",
+            BrokenPagedSSDCacheManager,
+        )
+
+        config = SchedulerConfig(paged_ssd_cache_dir=str(tmp_path / "missing-drive"))
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+
+        assert scheduler.paged_ssd_cache_manager is None
+        assert scheduler.paged_cache_manager is None
+        assert scheduler.block_aware_cache is None
+        assert scheduler._boundary_snapshot_store is None
+        assert scheduler._store_cache_executor is None
+        assert scheduler._store_cache_gate is None
+        assert "Failed to initialize paged SSD cache" in caplog.text
 
     def test_init_statistics_zero(self, mock_model, mock_tokenizer):
         """Test Scheduler initializes with zero statistics."""
@@ -839,6 +934,22 @@ class TestSchedulerXtcSpecialTokens:
 
         assert 2 in tokens
 
+    def test_includes_parser_stop_tokens_without_base_stop(
+        self, mock_model, mock_tokenizer
+    ):
+        """Parser stop tokens are XTC-protected but not BatchGenerator stops."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._output_parser_factory = _ParserStopFactory()
+        scheduler._output_parser_factory.stop_token_ids = {101, 102}
+
+        stop_tokens = scheduler._get_stop_tokens()
+        xtc_tokens = scheduler._get_xtc_special_tokens()
+
+        assert 101 not in stop_tokens
+        assert 102 not in stop_tokens
+        assert 101 in xtc_tokens
+        assert 102 in xtc_tokens
+
 
 class TestSyncAndClearCache:
     """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
@@ -1159,6 +1270,101 @@ class TestSchedulerBoundarySnapshots:
         assert args[2] == snapshot_extracted
         assert kwargs["model_cache_config"] == "boundary-config"
         assert "req-partial" not in scheduler._boundary_cache_snapshots
+
+    def test_boundary_override_preextracts_in_memory_intermediate_snapshots(
+        self, mock_model, mock_tokenizer
+    ):
+        """In-memory boundary snapshots must be extracted before worker access."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+
+        request = Request(
+            request_id="req-hot-cache",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.requests["req-hot-cache"] = request
+
+        raw_intermediate = object()
+        raw_latest = object()
+        extracted_intermediate = [{"state": ("intermediate",)}]
+        extracted_latest = [{"state": ("latest",)}]
+        scheduler._boundary_cache_snapshots["req-hot-cache"] = {
+            4: raw_intermediate,
+            8: raw_latest,
+        }
+
+        def extract(raw_cache):
+            if raw_cache is raw_latest:
+                return extracted_latest, "latest-config"
+            if raw_cache is raw_intermediate:
+                return extracted_intermediate, "intermediate-config"
+            raise AssertionError("unexpected raw cache")
+
+        with patch.object(scheduler, "_extract_cache_states", side_effect=extract) as ex:
+            result = scheduler._get_boundary_store_override(
+                "req-hot-cache", list(range(10))
+            )
+
+        assert result is not None
+        token_sequence, cache_to_store, model_config, provider = result
+        assert token_sequence == list(range(8))
+        assert cache_to_store is extracted_latest
+        assert model_config == "latest-config"
+        assert 4 in provider
+
+        ex.reset_mock()
+        assert provider[4] is extracted_intermediate
+        ex.assert_not_called()
+
+    def test_cleanup_finished_pre_evals_intermediate_boundary_snapshots(
+        self, mock_model, mock_tokenizer
+    ):
+        """Intermediate boundary snapshot arrays are materialized on engine thread."""
+        from omlx import scheduler as sched_mod
+
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        latest_arr = mx.zeros((1,))
+        intermediate_arr = mx.ones((1,))
+        latest_cache = [{"state": (latest_arr,), "cache_type": "ArraysCache"}]
+        intermediate_cache = [
+            {"state": (intermediate_arr,), "cache_type": "ArraysCache"}
+        ]
+        provider = sched_mod._BoundarySnapshotProvider(
+            store=None,
+            request_id="req-hot-cache",
+            valid_tcs=[4],
+            in_memory_snapshots={4: intermediate_cache},
+        )
+
+        request = Request(
+            request_id="req-hot-cache",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4]
+        request.num_prompt_tokens = 4
+        request.output_token_ids = [5, 6, 7]
+        request._extracted_cache = [{"state": ("final",)}]
+        request._model_cache_config = None
+        scheduler.running["req-hot-cache"] = request
+        scheduler.requests["req-hot-cache"] = request
+
+        with patch.object(
+            scheduler,
+            "_get_boundary_store_override",
+            return_value=([1, 2, 3, 4], latest_cache, None, provider),
+        ), patch.object(sched_mod.mx, "eval") as eval_, patch.object(
+            sched_mod, "_safe_sync_stream"
+        ):
+            scheduler._cleanup_finished({"req-hot-cache"})
+
+        eval_.assert_called_once()
+        assert eval_.call_args.args == (latest_arr, intermediate_arr)
 
     def test_boundary_snapshot_synchronizes_generation_stream(
         self, mock_model, mock_tokenizer
@@ -2021,6 +2227,7 @@ class TestDetectNeedsThinkPrefix:
         in their mlx-lm tokenizer, causing think_start_id to raise TypeError.
         """
         from unittest.mock import PropertyMock
+
         from conftest import MockTokenizer
 
         tokenizer = MockTokenizer()
@@ -2123,6 +2330,39 @@ class TestOutputParserSmoke:
         assert "<|channel>" not in full_stream
         assert "<channel|>" not in full_stream
         assert full_stream == "<think>\nreasoning</think>\nanswer"
+
+    def test_parser_stop_sets_finish_reason(self, mock_model):
+        tokenizer = self._GemmaTokenizer({11: "<|return|>"})
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=tokenizer,
+            config=SchedulerConfig(model_name="test-model"),
+        )
+        scheduler._output_parser_factory = _ParserStopFactory()
+
+        request = Request(
+            request_id="parser-stop-req",
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=5),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+
+        responses = [
+            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+        ]
+
+        outputs, finished_ids = scheduler._process_batch_responses(responses)
+
+        assert finished_ids == {"parser-stop-req"}
+        assert outputs[-1].finished is True
+        assert outputs[-1].finish_reason == "stop"
 
 
 class TestVLMPositionStateClearing:
@@ -2287,3 +2527,105 @@ class TestBuildStateMachineStopStrings:
                 assert tok in node
                 node = node[tok]
             assert "__match__" in node
+
+
+class TestTurboQuantMLAGuard:
+    """Regression tests for #1613: MLA models must not be TurboQuant-converted.
+
+    GLM-4.7-Flash / DeepSeek use Multi-head Latent Attention and read fetched
+    cache tensors directly (k_pe.swapaxes(...)), which crashes on TurboQuant's
+    quantized NamedTuple states ('TurboQuantMSEState' object has no attribute
+    'swapaxes'). _turboquant_eligible() must return False for them so they stay
+    fp16.
+    """
+
+    def test_mla_model_ineligible_by_config(self, mock_model, mock_tokenizer):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        # MLA config exposes kv_lora_rank (GLM-4.7-Flash, DeepSeek-V*).
+        scheduler.model = SimpleNamespace(args=SimpleNamespace(kv_lora_rank=512))
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_mla_model_ineligible_by_architecture(self, mock_model, mock_tokenizer):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        # No kv_lora_rank in config, but an attention submodule with the MLA
+        # down-projection / latent layernorm.
+        attn = SimpleNamespace(
+            kv_a_proj_with_mqa=object(),
+            kv_a_layernorm=object(),
+            kv_lora_rank=512,
+        )
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(), modules=lambda: [attn]
+        )
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_standard_model_still_eligible(self, mock_model, mock_tokenizer):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        # Standard MHA/GQA model: no kv_lora_rank, no MLA submodules.
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(num_hidden_layers=4), modules=lambda: []
+        )
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is False
+        assert scheduler._turboquant_eligible([KVCache()]) is True
+
+    def test_mla_model_ineligible_nested_text_config(self, mock_model, mock_tokenizer):
+        # VLM MLA (e.g. kimi_vl): kv_lora_rank is nested under text_config, not
+        # on the top-level args.
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        scheduler.model = SimpleNamespace(
+            args=SimpleNamespace(text_config=SimpleNamespace(kv_lora_rank=512))
+        )
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_mla_vlm_adapter_delegates_to_language_model(
+        self, mock_model, mock_tokenizer
+    ):
+        # VLMModelAdapter exposes _language_model; its args surface kv_lora_rank.
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._turboquant_kv_bits = 4.0
+        lm = SimpleNamespace(args=SimpleNamespace(kv_lora_rank=512))
+        scheduler.model = SimpleNamespace(args=SimpleNamespace(), _language_model=lm)
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is True
+        assert scheduler._turboquant_eligible([KVCache()]) is False
+
+    def test_mla_detection_is_memoized(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        calls = {"n": 0}
+
+        def _modules():
+            calls["n"] += 1
+            return []
+
+        scheduler.model = SimpleNamespace(args=SimpleNamespace(), modules=_modules)
+        scheduler._mla_model = None
+
+        assert scheduler._model_uses_mla() is False
+        assert scheduler._model_uses_mla() is False
+        assert calls["n"] == 1  # walked once, then cached

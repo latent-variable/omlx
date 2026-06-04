@@ -96,7 +96,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Native macOS app for the oMLX server"
+            "value" : "Local AI, no more waiting on your Mac."
           }
         }
       }
@@ -1602,6 +1602,18 @@
         }
       }
     },
+    "common.copy_model_id" : {
+      "comment" : "Tooltip and accessibility label for a button that copies a model identifier",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy model ID"
+          }
+        }
+      }
+    },
     "common.create" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1609,6 +1621,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Create"
+          }
+        }
+      }
+    },
+    "common.back" : {
+      "comment" : "Back button label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Back"
           }
         }
       }
@@ -1695,6 +1719,18 @@
         }
       }
     },
+    "downloads.button.show_card" : {
+      "comment" : "Tooltip on the info button that opens a model's README sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "View model card"
+          }
+        }
+      }
+    },
     "downloads.cancel.help" : {
       "comment" : "Tooltip on the X button that cancels or removes a download task",
       "extractionState" : "manual",
@@ -1703,6 +1739,162 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Cancel"
+          }
+        }
+      }
+    },
+    "downloads.card.close" : {
+      "comment" : "Tooltip on the model card sheet's close button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close"
+          }
+        }
+      }
+    },
+    "downloads.card.download" : {
+      "comment" : "Primary button in the model card sheet that starts downloading the displayed model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download"
+          }
+        }
+      }
+    },
+    "downloads.card.empty" : {
+      "comment" : "Empty state shown when the upstream repo has no model card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model doesn't ship a README."
+          }
+        }
+      }
+    },
+    "downloads.card.files.empty" : {
+      "comment" : "Empty state in the Files tab when the upstream API doesn't list any files",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No files reported."
+          }
+        }
+      }
+    },
+    "downloads.card.error" : {
+      "comment" : "Title shown in the model card sheet when the fetch failed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn't load model card"
+          }
+        }
+      }
+    },
+    "downloads.card.loading" : {
+      "comment" : "Status text shown while the model README is being fetched",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loading model card…"
+          }
+        }
+      }
+    },
+    "downloads.card.lora_warning" : {
+      "comment" : "Warning banner shown in the model card sheet when the repo is an adapter rather than a full model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This is a LoRA adapter. It needs a compatible base model to run — downloading on its own won't load in oMLX."
+          }
+        }
+      }
+    },
+    "downloads.card.retry" : {
+      "comment" : "Retry button shown after the model card fetch failed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Retry"
+          }
+        }
+      }
+    },
+    "downloads.card.tab.card" : {
+      "comment" : "Tab label in the model card sheet for the README content",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model Card"
+          }
+        }
+      }
+    },
+    "downloads.card.tab.files" : {
+      "comment" : "Tab label in the model card sheet for the repo file list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Files"
+          }
+        }
+      }
+    },
+    "downloads.card.tab.tags" : {
+      "comment" : "Tab label in the model card sheet for the repo tag list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tags"
+          }
+        }
+      }
+    },
+    "downloads.card.tags.empty" : {
+      "comment" : "Empty state in the Tags tab when the upstream API doesn't list any tags",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No tags."
+          }
+        }
+      }
+    },
+    "downloads.card.view_upstream" : {
+      "comment" : "Link button in the model card sheet that opens the upstream model page; placeholder is 'Hugging Face' or 'ModelScope'",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "View on %@"
           }
         }
       }
@@ -2755,13 +2947,13 @@
       }
     },
     "menubar.header.running" : {
-      "comment" : "Menubar status header when the server is running; placeholders are PID and port",
+      "comment" : "Menubar status header when the server is running; placeholder is the port",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: running · pid %1$@ · :%2$@"
+            "value" : "Server: running (port %@)"
           }
         }
       }
@@ -2785,7 +2977,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Server: stopped"
+            "value" : "oMLX stopped"
           }
         }
       }
@@ -2803,13 +2995,13 @@
       }
     },
     "menubar.header.unresponsive" : {
-      "comment" : "Menubar status header when the server is unresponsive; placeholder is PID",
+      "comment" : "Menubar status header when the server is unresponsive",
       "extractionState" : "extracted_with_value",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Server: unresponsive · pid %@ (auto-recover or Force Restart)"
+            "value" : "Server: unresponsive (auto-recover or Force Restart)"
           }
         }
       }
@@ -2822,18 +3014,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "About oMLX"
-          }
-        }
-      }
-    },
-    "menubar.item.admin_panel" : {
-      "comment" : "Menubar item that opens the main app window / admin panel",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Admin Panel"
           }
         }
       }
@@ -2886,6 +3066,18 @@
         }
       }
     },
+    "menubar.item.settings" : {
+      "comment" : "Menubar item that opens the native settings/preferences window",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Settings…"
+          }
+        }
+      }
+    },
     "menubar.item.start_server" : {
       "comment" : "Menubar item that starts the server",
       "extractionState" : "manual",
@@ -2906,6 +3098,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Stop Server"
+          }
+        }
+      }
+    },
+    "menubar.item.web_dashboard" : {
+      "comment" : "Menubar item that opens the browser-based web admin dashboard with auto-login",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open Web Dashboard"
           }
         }
       }
@@ -7128,6 +7332,30 @@
         }
       }
     },
+    "server.row.auto_start_on_launch" : {
+      "comment" : "Row label for the server auto-start on app launch toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically start server on launch"
+          }
+        }
+      }
+    },
+    "server.row.auto_start_on_launch.sub" : {
+      "comment" : "Sublabel under the server auto-start on app launch toggle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "When disabled, the menu bar app opens without starting the server."
+          }
+        }
+      }
+    },
     "server.row.listen_address" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -7192,7 +7420,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Default 8080. Server restarts on save."
+            "value" : "Default 8000. Server restarts on save."
           }
         }
       }
@@ -7251,6 +7479,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Logging"
+          }
+        }
+      }
+    },
+    "server.section.startup" : {
+      "comment" : "Section heading for server launch behavior settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server Startup"
           }
         }
       }
@@ -9744,7 +9984,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Session Stats"
+            "value" : "Serving Stats"
           }
         },
         "ja" : {
@@ -9773,6 +10013,66 @@
         }
       }
     },
+    "status.speed.prompt_processing" : {
+      "comment" : "Label for average prompt-processing speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt Processing"
+          }
+        }
+      }
+    },
+    "status.speed.prompt_processing_note" : {
+      "comment" : "Note after prompt-processing speed label",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "(excl. cached)"
+          }
+        }
+      }
+    },
+    "status.speed.prompt_processing.tile" : {
+      "comment" : "Tile label for average prompt-processing speed excluding cached tokens",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt Processing (excl. cached)"
+          }
+        }
+      }
+    },
+    "status.speed.section_label" : {
+      "comment" : "Header label above average serving speed metrics",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Average Speed"
+          }
+        }
+      }
+    },
+    "status.speed.token_generation" : {
+      "comment" : "Label for average token-generation speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token Generation"
+          }
+        }
+      }
+    },
     "status.system.subtitle" : {
       "comment" : "Subtitle of the System section showing CPU architecture and macOS version; placeholders are the architecture string and macOS major.minor numbers",
       "extractionState" : "extracted_with_value",
@@ -9791,7 +10091,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Cached"
+            "value" : "Cached Tokens"
+          }
+        }
+      }
+    },
+    "status.tile.cache_efficiency" : {
+      "comment" : "Stat tile label for cache efficiency percentage",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache Efficiency"
           }
         }
       }
@@ -9860,7 +10172,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Total Tokens"
+            "value" : "Total Prefill Tokens"
           }
         }
       }
@@ -9902,25 +10214,25 @@
       }
     },
     "status.updates.auto_download" : {
-      "comment" : "Row label for the auto-download updates toggle",
+      "comment" : "Row label for the automatic update notification toggle",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Auto-download Updates"
+            "value" : "Notify About Updates"
           }
         }
       }
     },
     "status.updates.auto_download.sub" : {
-      "comment" : "Sublabel for the auto-download toggle",
+      "comment" : "Sublabel for the automatic update notification toggle",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Download in the background, install on next launch"
+            "value" : "Show release notes before downloading in the background"
           }
         }
       }
@@ -9980,6 +10292,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Check Now"
+          }
+        }
+      }
+    },
+    "status.updates.downloading_button" : {
+      "comment" : "Updates action button label while the download is in progress; placeholder is the percent complete",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloading… %lld%%"
+          }
+        }
+      }
+    },
+    "status.updates.downloading_primary" : {
+      "comment" : "Primary update status line while the new build is downloading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloading update…"
+          }
+        }
+      }
+    },
+    "status.updates.downloading_secondary" : {
+      "comment" : "Secondary update status line during download; placeholder is the percent complete",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloading · %lld%%"
+          }
+        }
+      }
+    },
+    "status.updates.error_primary" : {
+      "comment" : "Primary update status line when checking for updates failed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update check failed"
           }
         }
       }
@@ -10067,6 +10427,18 @@
         }
       }
     },
+    "status.updates.ready_secondary" : {
+      "comment" : "Secondary update status line once the staged bundle is ready; placeholder is the version",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ is ready to install"
+          }
+        }
+      }
+    },
     "status.updates.title" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -10102,6 +10474,138 @@
         }
       }
     },
+    "update.confirm.empty_notes" : {
+      "comment" : "Empty state when a GitHub release has no release notes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This release does not include detailed notes."
+          }
+        }
+      }
+    },
+    "update.confirm.install" : {
+      "comment" : "Primary button to download, install, and relaunch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download, Install & Relaunch"
+          }
+        }
+      }
+    },
+    "update.confirm.install_ready" : {
+      "comment" : "Primary button when the update is already staged",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Install & Relaunch"
+          }
+        }
+      }
+    },
+    "update.confirm.later" : {
+      "comment" : "Dismiss button in the update confirmation sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Later"
+          }
+        }
+      }
+    },
+    "update.confirm.restart_notice" : {
+      "comment" : "Notice explaining what happens after confirming an update",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX will quit, install the update, and relaunch."
+          }
+        }
+      }
+    },
+    "update.confirm.size" : {
+      "comment" : "Update confirmation download size line; placeholder is a formatted byte size or Unknown",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download size: %@"
+          }
+        }
+      }
+    },
+    "update.confirm.subtitle" : {
+      "comment" : "Subtitle for the update confirmation sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Review the release notes before downloading and relaunching."
+          }
+        }
+      }
+    },
+    "update.confirm.title" : {
+      "comment" : "Update confirmation sheet title; placeholder is the version",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX %@ is available"
+          }
+        }
+      }
+    },
+    "update.confirm.view_release" : {
+      "comment" : "Tooltip for the release link button in the update confirmation sheet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "View release on GitHub"
+          }
+        }
+      }
+    },
+    "update.error.no_dmg" : {
+      "comment" : "Shown when the release has no matching DMG asset",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No installable DMG was attached to this release."
+          }
+        }
+      }
+    },
+    "update.error.swap_failed" : {
+      "comment" : "Shown when the swap script can't find the staged bundle",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not find the staged update. Try downloading again."
+          }
+        }
+      }
+    },
     "update.channel.beta" : {
       "comment" : "Display name for the Beta update channel",
       "extractionState" : "manual",
@@ -10110,6 +10614,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Beta"
+          }
+        }
+      }
+    },
+    "update.channel.dev" : {
+      "comment" : "Display name for the Dev update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dev"
           }
         }
       }
@@ -10126,6 +10642,18 @@
         }
       }
     },
+    "update.channel.release_candidate" : {
+      "comment" : "Display name for the Release Candidate update channel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Release Candidate"
+          }
+        }
+      }
+    },
     "update.channel.stable" : {
       "comment" : "Display name for the Stable update channel",
       "extractionState" : "manual",
@@ -10134,54 +10662,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Stable"
-          }
-        }
-      }
-    },
-    "welcome.api_key.confirm.label" : {
-      "comment" : "Row label for the API key confirmation field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Confirm"
-          }
-        }
-      }
-    },
-    "welcome.api_key.confirm.sub" : {
-      "comment" : "Sublabel for the Confirm API key field",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Re-enter the key to catch typos"
-          }
-        }
-      }
-    },
-    "welcome.api_key.generate" : {
-      "comment" : "Button label that mints a random API key",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Generate"
-          }
-        }
-      }
-    },
-    "welcome.api_key.generate.help" : {
-      "comment" : "Tooltip on the Generate API key button",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Generate a random 40-char API key"
           }
         }
       }
@@ -10211,25 +10691,13 @@
       }
     },
     "welcome.api_key.placeholder" : {
-      "comment" : "Placeholder text inside the API key text fields",
+      "comment" : "Placeholder text inside the API key text field",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "sk-omlx-…"
-          }
-        }
-      }
-    },
-    "welcome.api_key.section" : {
-      "comment" : "Section heading above the API key rows in Welcome wizard",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "API Key"
+            "value" : "Create an API key"
           }
         }
       }
@@ -10247,13 +10715,13 @@
       }
     },
     "welcome.api_key.sub" : {
-      "comment" : "Sublabel describing API key format requirements",
+      "comment" : "Sublabel explaining API key usage",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "At least 4 printable characters, no whitespace"
+            "value" : "This key is also your Web Dashboard login password."
           }
         }
       }
@@ -10306,32 +10774,32 @@
         }
       }
     },
-    "welcome.button.open_admin" : {
-      "comment" : "Secondary footer button: start server and open the browser dashboard",
+    "welcome.button.get_started" : {
+      "comment" : "Primary footer button that advances from the intro to setup",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Open Admin Panel & Close"
+            "value" : "Get Started"
           }
         }
       }
     },
-    "welcome.button.reset" : {
-      "comment" : "Clear the Model Directory override",
+    "welcome.button.open_dashboard" : {
+      "comment" : "Footer button that opens the local web dashboard",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Reset"
+            "value" : "Open Web Dashboard"
           }
         }
       }
     },
     "welcome.button.start_server" : {
-      "comment" : "Primary footer button that spawns the server and closes the wizard",
+      "comment" : "Primary footer button that spawns the server",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -10349,7 +10817,43 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Starting…"
+            "value" : "Starting Server..."
+          }
+        }
+      }
+    },
+    "welcome.complete.description" : {
+      "comment" : "Description on the Welcome completion page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX is running locally at http://127.0.0.1:%@. Open the web dashboard to download your first model, manage settings, and connect your coding tools."
+          }
+        }
+      }
+    },
+    "welcome.complete.status" : {
+      "comment" : "Short success status on the Welcome completion page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server started. Dashboard is ready."
+          }
+        }
+      }
+    },
+    "welcome.complete.title" : {
+      "comment" : "Heading on the Welcome completion page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All set!"
           }
         }
       }
@@ -10374,18 +10878,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Invalid port."
-          }
-        }
-      }
-    },
-    "welcome.error.key_mismatch" : {
-      "comment" : "Welcome wizard validation: confirm field differs",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "API keys do not match."
           }
         }
       }
@@ -10517,7 +11009,31 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "LLM inference, optimized for your Mac"
+            "value" : "macOS-native MLX server with smart caching.\nClaude Code, OpenClaw, and Cursor respond in 5 seconds, not 90."
+          }
+        }
+      }
+    },
+    "welcome.header.subtitle" : {
+      "comment" : "Short tagline under the Welcome wizard's main heading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local AI, no more waiting."
+          }
+        }
+      }
+    },
+    "welcome.header.meta" : {
+      "comment" : "Short metadata line on the Welcome intro page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apple Silicon · macOS-native · Apache 2.0"
           }
         }
       }
@@ -10529,31 +11045,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Welcome to oMLX"
-          }
-        }
-      }
-    },
-    "welcome.hint.models_library" : {
-      "comment" : "Hint line pointing the user to Downloads after first-run",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Your model library starts empty — visit Downloads to fetch your first model."
-          }
-        }
-      }
-    },
-    "welcome.hint.reopen" : {
-      "comment" : "Hint line telling the user how to get back to the Welcome wizard",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "You can re-open this wizard anytime from the menubar."
+            "value" : "oMLX"
           }
         }
       }
@@ -10565,7 +11057,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Stored in `~/.omlx/settings.json`. Sub-keys for individual apps can be added later in Security."
+            "value" : "Settings are stored in ~/.omlx/settings.json."
           }
         }
       }
@@ -10577,19 +11069,43 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Confirm where weights live and pick an API key. You can change either later in Settings."
+            "value" : "Choose where models live, pick a port, and create the API key you'll use from apps and the web dashboard."
           }
         }
       }
     },
-    "welcome.storage.base_dir.label" : {
-      "comment" : "Row label for the Base Directory picker in Welcome wizard",
+    "welcome.setup.title" : {
+      "comment" : "Heading on the Welcome setup page",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Base Directory"
+            "value" : "Set up your local server"
+          }
+        }
+      }
+    },
+    "welcome.setup.local.title" : {
+      "comment" : "Title for the local server setup card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local server"
+          }
+        }
+      }
+    },
+    "welcome.setup.local.body" : {
+      "comment" : "Body for the local server setup card",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX binds to 127.0.0.1 on first run, so clients on this Mac can use it without exposing the server to your network."
           }
         }
       }
@@ -10606,26 +11122,14 @@
         }
       }
     },
-    "welcome.storage.model_dir.placeholder" : {
-      "comment" : "Placeholder string shown when Model Directory is unset; placeholder is the base path's leaf name",
-      "extractionState" : "extracted_with_value",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "<%@>/models"
-          }
-        }
-      }
-    },
     "welcome.storage.model_dir.sub" : {
-      "comment" : "Sublabel hinting that Model Directory is optional",
+      "comment" : "Sublabel explaining the model directory",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Optional — defaults to <base>/models"
+            "value" : "Where downloaded models are stored."
           }
         }
       }
@@ -10643,25 +11147,13 @@
       }
     },
     "welcome.storage.port.sub" : {
-      "comment" : "Sublabel for the port field with the recommended range",
+      "comment" : "Sublabel for the port field with the recommended default",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "1024-65535 recommended; default 8080"
-          }
-        }
-      }
-    },
-    "welcome.storage.section" : {
-      "comment" : "Section heading above the Storage rows in Welcome wizard",
-      "extractionState" : "manual",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Storage"
+            "value" : "Default 8000. Change this only if the port is already in use."
           }
         }
       }

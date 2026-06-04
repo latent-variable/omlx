@@ -357,7 +357,8 @@ class TestAdvanceChunkedPrefills:
         assert rejected == []
 
     def test_runtime_error_surfaces_as_request_error(self):
-        """RuntimeError mid-chunk yields a finish_reason=\"error\" RequestOutput."""
+        """A non-memory RuntimeError mid-chunk yields a finish_reason="error"
+        RequestOutput immediately (only memory-pressure errors are requeued)."""
         sched = _make_scheduler()
         req = _make_request("oom")
         sched.requests[req.request_id] = req
@@ -367,7 +368,7 @@ class TestAdvanceChunkedPrefills:
 
         with patch.object(
             sched, "_step_prefill_chunk",
-            side_effect=RuntimeError("Memory limit exceeded")
+            side_effect=RuntimeError("kernel panic")
         ):
             scheduled = []
             rejected = []
@@ -382,7 +383,33 @@ class TestAdvanceChunkedPrefills:
         assert out.request_id == "oom"
         assert out.finished is True
         assert out.finish_reason == "error"
-        assert "Memory limit" in out.error
+        assert "kernel panic" in out.error
+
+    def test_memory_error_requeues_instead_of_surfacing(self):
+        """A memory-pressure RuntimeError mid-chunk requeues the request for a
+        fresh attempt instead of immediately surfacing an error to the client."""
+        sched = _make_scheduler()
+        req = _make_request("oom-mem")
+        sched.requests[req.request_id] = req
+        state = _make_prefill_state(sched, req)
+        sched.prefilling.append(req)
+        sched._prefill_states[req.request_id] = state
+
+        with patch.object(
+            sched, "_step_prefill_chunk",
+            side_effect=RuntimeError("Memory limit exceeded during chunked prefill")
+        ):
+            scheduled = []
+            rejected = []
+            sched._advance_chunked_prefills(scheduled, rejected)
+
+        # No client-facing error; the request is reset and back on the queue.
+        assert rejected == []
+        assert req.request_id not in sched._prefill_states
+        assert req not in sched.prefilling
+        assert sched.requests.get(req.request_id) is req
+        assert req in sched.waiting
+        assert req.prefill_oom_retries == 1
 
     def test_multiple_requests_all_advanced(self):
         """All requests in prefilling get one chunk advanced per call."""
@@ -547,18 +574,7 @@ class TestScheduleWaitingChunkedFork:
         assert result == 1024
 
     def test_adaptive_throttle_tier_512(self):
-        """25-50% of band → 512."""
-        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
-        # 35% of band: 8 + 4*0.35 = 9.4 GB
-        a, b = self._mock_current(sched, 9.4)
-        with a, b:
-            result = sched._adaptive_chunk_size(
-                2048, request_id="r1", loop_label="external"
-            )
-        assert result == 512
-
-    def test_adaptive_throttle_tier_256(self):
-        """50-75% of band → 256."""
+        """50%+ of band → 512."""
         sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
         # 60% of band: 8 + 4*0.60 = 10.4 GB
         a, b = self._mock_current(sched, 10.4)
@@ -566,29 +582,18 @@ class TestScheduleWaitingChunkedFork:
             result = sched._adaptive_chunk_size(
                 2048, request_id="r1", loop_label="external"
             )
-        assert result == 256
-
-    def test_adaptive_throttle_tier_128(self):
-        """75%+ of band → 128 (or min_chunk if larger)."""
-        sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
-        # 80% of band: 8 + 4*0.80 = 11.2 GB
-        a, b = self._mock_current(sched, 11.2)
-        with a, b:
-            result = sched._adaptive_chunk_size(
-                2048, request_id="r1", loop_label="external"
-            )
-        assert result == 128
+        assert result == 512
 
     def test_adaptive_throttle_requested_smaller_than_tier(self):
         """Requested chunk already smaller than the tier target → pass through."""
         sched = self._setup_throttle(max_bytes_gb=10, hard_cap_gb=12)
-        # 80% of band → tier 128. But requested=64 < 128.
-        a, b = self._mock_current(sched, 11.2)
+        # 60% of band → tier 512. But requested=256 < 512.
+        a, b = self._mock_current(sched, 10.4)
         with a, b:
             result = sched._adaptive_chunk_size(
-                64, request_id="r1", loop_label="external"
+                256, request_id="r1", loop_label="external"
             )
-        assert result == 64
+        assert result == 256
 
     def test_adaptive_throttle_no_cap_passthrough(self):
         """When hard limit or soft base is unset (=0), no throttle."""
@@ -740,7 +745,7 @@ class TestPrefillRejectionReleasesPagedCache:
 
         with patch.object(
             sched, "_do_external_prefill",
-            side_effect=RuntimeError("Memory limit exceeded during prefill"),
+            side_effect=RuntimeError("kernel panic"),
         ):
             sched._schedule_waiting()
 
@@ -764,7 +769,7 @@ class TestPrefillRejectionReleasesPagedCache:
         ):
             with patch.object(
                 sched, "_step_prefill_chunk",
-                side_effect=RuntimeError("Memory limit exceeded"),
+                side_effect=RuntimeError("kernel panic"),
             ):
                 sched._schedule_waiting()
 

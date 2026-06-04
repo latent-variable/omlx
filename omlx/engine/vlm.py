@@ -39,8 +39,6 @@ from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..models.vlm import VLMModelAdapter
-from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
-from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -524,6 +522,7 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        prefill_eviction_callback: Any | None = None,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -531,6 +530,7 @@ class VLMBatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._prefill_eviction_callback = prefill_eviction_callback
 
         self._vlm_model = None
         self._processor = None
@@ -706,6 +706,7 @@ class VLMBatchedEngine(BaseEngine):
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
         # loader thread so per-engine inference threads can read them (#1304).
         from ..utils.model_loading import materialize_lazy_state
+
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._vlm_model
         )
@@ -745,15 +746,6 @@ class VLMBatchedEngine(BaseEngine):
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
         self._adapter = VLMModelAdapter(self._vlm_model)
 
-        # Patch mlx-vlm GatedDeltaNet to mirror mlx-lm fixes (cache.advance(S)
-        # + mx.contiguous on cache[0]) that mlx-vlm e41cd25 still lacks.
-        # Class-level monkey-patch — no-op when target classes are absent
-        # or already fixed upstream.
-        apply_gated_delta_advance_patch()
-        # Patch mlx-vlm Qwen3_5Attention to use plain RoPE on text-only
-        # inputs. Preserves mRoPE for genuine multimodal positions.
-        apply_qwen3_5_attention_patch()
-
         # Create scheduler config
         scheduler_config = (
             copy.copy(self._scheduler_config)
@@ -766,6 +758,7 @@ class VLMBatchedEngine(BaseEngine):
             model_name=self._model_name,
             scheduler_config=scheduler_config,
             stream_interval=self._stream_interval,
+            prefill_eviction_callback=self._prefill_eviction_callback,
         )
 
         # Create engine with adapter as the "model"
@@ -811,6 +804,8 @@ class VLMBatchedEngine(BaseEngine):
                     def _load_draft():
                         from ..patches.mlx_lm_mtp import set_mtp_active
 
+                        from ..utils.model_loading import materialize_lazy_state
+
                         was_mtp = False
                         try:
                             from ..patches.mlx_lm_mtp import is_mtp_active
@@ -826,8 +821,18 @@ class VLMBatchedEngine(BaseEngine):
                             )
                             if custom_loaded is not None:
                                 draft_model, _ = custom_loaded
-                                return draft_model
-                            draft_model, _ = mlx_lm_load(specprefill_draft)
+                            else:
+                                draft_model, _ = mlx_lm_load(specprefill_draft)
+                            # Materialize frozen buffers (RoPE freqs, etc.)
+                            # on the loader thread. mlx_lm.load only does
+                            # mx.eval(model.parameters()) and leaves siblings
+                            # lazy bound to this thread's stream. Without
+                            # this, the first score_tokens() call from
+                            # Scheduler.step on the per-engine executor
+                            # thread raises "no Stream(gpu, X) in current
+                            # thread". Same root cause and fix as e93c408
+                            # for the VLM MTP drafter.
+                            materialize_lazy_state(draft_model)
                             return draft_model
                         finally:
                             set_mtp_active(was_mtp)
@@ -1438,9 +1443,7 @@ class VLMBatchedEngine(BaseEngine):
                     # Fallback: whole-request entry (stored when per-image split
                     # is unsupported, e.g. Gemma 4 multi-image with per-image
                     # resize). Mirrors the store-side branch below.
-                    cached_whole = self._vision_cache.get(
-                        image_hash, self._model_name
-                    )
+                    cached_whole = self._vision_cache.get(image_hash, self._model_name)
 
                 if all(f is not None for f in cached_per_image):
                     # All images cached individually — combine and use
