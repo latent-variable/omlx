@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
+from types import SimpleNamespace
 
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
@@ -53,6 +56,72 @@ class HarmonyTokenizer:
         return FakeDetokenizer(lambda token_id: self._encoding.decode([token_id]))
 
 
+class CohereTokenizer:
+    def __init__(self, token_map: dict[int, str]):
+        self._token_map = token_map
+
+    @property
+    def detokenizer(self):
+        return FakeDetokenizer(lambda token_id: self._token_map[token_id])
+
+    def decode(self, token_ids, skip_special_tokens: bool = True):
+        return "".join(self._token_map[token_id] for token_id in token_ids)
+
+
+class _FakeMelodyOptions:
+    def cmd4(self):
+        return self
+
+    def stream_tool_actions(self):
+        return self
+
+
+class _FakeMelodyFilter:
+    def __init__(self, options):
+        self.options = options
+
+    def write_decoded(self, decoded_text: str):
+        if decoded_text.startswith("R:"):
+            return SimpleNamespace(
+                content=None,
+                reasoning=decoded_text[2:],
+                tool_calls=[],
+            )
+        if decoded_text.startswith("C:"):
+            return SimpleNamespace(
+                content=decoded_text[2:],
+                reasoning=None,
+                tool_calls=[],
+            )
+        if decoded_text.startswith("T1"):
+            tool_call = SimpleNamespace(
+                index=0,
+                id="call_",
+                name="look",
+                arguments='{"q"',
+            )
+            return SimpleNamespace(content=None, reasoning=None, tool_calls=[tool_call])
+        if decoded_text.startswith("T2"):
+            tool_call = SimpleNamespace(
+                index=0,
+                id="1",
+                name="up",
+                arguments=':"x"}',
+            )
+            return SimpleNamespace(content=None, reasoning=None, tool_calls=[tool_call])
+        return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
+
+    def flush_partials(self):
+        return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
+
+
+def _install_fake_melody(monkeypatch):
+    module = types.ModuleType("cohere_melody")
+    module.PyFilter = _FakeMelodyFilter
+    module.PyFilterOptions = _FakeMelodyOptions
+    monkeypatch.setitem(sys.modules, "cohere_melody", module)
+
+
 def _write_json(path, data):
     path.write_text(json.dumps(data))
 
@@ -95,6 +164,74 @@ class ByteFallbackTokenizer:
         if raw == bytes([0xEC, 0x9E, 0xA0]):
             return "\uc7a0"
         return "\ufffd" * sum(1 for token_id in token_ids if token_id != 0)
+
+
+class TestCohere2MoeOutputParserSession:
+    def test_detects_cohere2_moe_from_model_config(self, monkeypatch):
+        _install_fake_melody(monkeypatch)
+        tokenizer = CohereTokenizer({1: "C:hello"})
+
+        factory = detect_output_parser(
+            "North-Mini-Code",
+            tokenizer,
+            {"model_type": "cohere2_moe"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "cohere2_moe"
+
+    def test_streams_reasoning_as_think_block_and_visible_content(self, monkeypatch):
+        _install_fake_melody(monkeypatch)
+        tokenizer = CohereTokenizer(
+            {
+                1: "R:reasoning",
+                2: "C:answer",
+            }
+        )
+        factory = detect_output_parser(
+            "North-Mini-Code",
+            tokenizer,
+            {"model_type": "cohere2_moe"},
+        )
+        session = factory.create_session(tokenizer)
+
+        parts = []
+        visible = []
+        for token_id in [1, 2]:
+            result = session.process_token(token_id)
+            parts.append(result.stream_text)
+            visible.append(result.visible_text)
+        final = session.finalize()
+        parts.append(final.stream_text)
+        visible.append(final.visible_text)
+
+        assert "".join(parts) == "<think>\nreasoning</think>\nanswer"
+        assert "".join(visible) == "<think>\nreasoning</think>\nanswer"
+        assert final.tool_calls == []
+        assert final.finish_reason is None
+
+    def test_accumulates_streamed_tool_call_deltas(self, monkeypatch):
+        _install_fake_melody(monkeypatch)
+        tokenizer = CohereTokenizer({1: "T1", 2: "T2"})
+        factory = detect_output_parser(
+            "North-Mini-Code",
+            tokenizer,
+            {"model_type": "cohere2_moe"},
+        )
+        session = factory.create_session(tokenizer)
+
+        assert session.process_token(1).stream_text == ""
+        assert session.process_token(2).stream_text == ""
+        final = session.finalize()
+
+        assert final.tool_calls == [
+            {
+                "id": "call_1",
+                "name": "lookup",
+                "arguments": '{"q":"x"}',
+            }
+        ]
+        assert final.finish_reason == "tool_calls"
 
 
 class TestGemma4OutputParserSession:
@@ -287,6 +424,117 @@ class TestGemma4OutputParserSession:
 
 
 class TestOutputParserFactory:
+    def test_detects_minimax_m3_by_config(self):
+        tokenizer = CohereTokenizer({1: "x"})
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "minimax_m3"
+
+    def test_minimax_m3_parser_extracts_tool_calls(self, monkeypatch):
+        module = types.ModuleType("mlx_vlm.tool_parsers.minimax_m3")
+
+        def parse_tool_call(text):
+            assert "lookup" in text
+            return {"name": "lookup", "arguments": {"query": "mlx"}}
+
+        module.parse_tool_call = parse_tool_call
+        monkeypatch.setitem(sys.modules, "mlx_vlm.tool_parsers.minimax_m3", module)
+
+        start = "]<]minimax[>[<tool_call>"
+        end = "]<]minimax[>[</tool_call>"
+        tokenizer = CohereTokenizer(
+            {
+                1: "before ",
+                2: start,
+                3: ']<]minimax[>[<invoke name="lookup">',
+                4: "]<]minimax[>[</invoke>",
+                5: end,
+                6: " after",
+            }
+        )
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+        session = factory.create_session(tokenizer)
+
+        visible = []
+        stream = []
+        for token_id in [1, 2, 3, 4, 5, 6]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+        final = session.finalize()
+
+        assert "".join(stream) == "before  after"
+        assert start not in "".join(stream)
+        assert "".join(visible) + final.visible_text == "before  after"
+        assert final.tool_calls == [{"name": "lookup", "arguments": '{"query":"mlx"}'}]
+        assert final.finish_reason == "tool_calls"
+
+    def test_minimax_m3_parser_normalizes_thinking_and_strips_eos(self):
+        tokenizer = CohereTokenizer(
+            {
+                1: "<mm:think>",
+                2: "reasoning",
+                3: "</mm:think>",
+                4: "Answer",
+                5: "[e~[",
+                6: "]!d~[",
+            }
+        )
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+        session = factory.create_session(tokenizer)
+
+        stream = []
+        visible = []
+        stop_seen = False
+        record_flags = []
+        for token_id in [1, 2, 3, 4, 6, 5]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+            stop_seen = stop_seen or result.is_stop
+            record_flags.append(result.record_token)
+        final = session.finalize()
+        stream.append(final.stream_text)
+        visible.append(final.visible_text)
+
+        assert "".join(stream) == "<think>reasoning</think>Answer"
+        assert "".join(visible) == "<think>reasoning</think>Answer"
+        assert stop_seen is True
+        assert record_flags[-1] is False
+
+    def test_minimax_m3_factory_exposes_native_thinking_markers(self):
+        tokenizer = CohereTokenizer({})
+        tokenizer.convert_tokens_to_ids = lambda text: {
+            "[e~[": 200020,
+            "<mm:think>": 200059,
+            "</mm:think>": 200060,
+        }.get(text, -1)
+        tokenizer.unk_token_id = -1
+
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+
+        assert factory.thinking_start_text == "<mm:think>"
+        assert factory.thinking_start_output_text == "<think>\n"
+        assert factory.thinking_end_text == "</mm:think>"
+        assert factory.stop_token_ids == {200020}
+
     def test_detects_gemma4(self):
         tokenizer = GemmaTokenizer({1: "x"})
         factory = detect_output_parser(
