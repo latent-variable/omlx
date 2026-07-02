@@ -144,29 +144,25 @@ class ChunkReuseEngine:
     # -- arch detection -----------------------------------------------------
 
     def _detect_arch(self, model) -> str:
+        """Classify the model from its layer structure.
+
+        Structure (is_linear flags, per-layer cache types) is the reliable
+        signal: make_cache() can return incomplete types on the first call for
+        lazily-initialized quantized models, so we don't rely on it alone.
+        Order: hybrid (qwen3_5-style linear+attention) first, then full-attn,
+        else unsupported (sliding-window / rotating / mamba).
+        """
         try:
-            caches = model.make_cache() if hasattr(model, "make_cache") else None
-        except Exception as e:  # noqa: BLE001
-            logger.info("chunk reuse: make_cache() failed (%s); assuming full-attn", e)
-            caches = None
-        if caches is None:
-            return "full"  # plain KVCache default
-        kinds = sorted({type(c).__name__ for c in caches})
-        if set(kinds) <= {"KVCache"}:
+            crh.get_hybrid_layout(model)  # raises unless qwen3_5-style hybrid
+            return "hybrid"
+        except Exception:  # noqa: BLE001 — not a hybrid; try full-attn
+            pass
+        try:
+            cr.get_layer_ropes(model)  # raises on non-plain (e.g. rotating) caches
             return "full"
-        if set(kinds) <= {"KVCache", "ArraysCache"}:
-            # hybrid — confirm the qwen3_5 layout is introspectable
-            try:
-                crh.get_hybrid_layout(model)
-                return "hybrid"
-            except Exception as e:  # noqa: BLE001
-                logger.info(
-                    "chunk reuse: hybrid layout introspection failed (%s); "
-                    "cache kinds=%s; disabling", e, kinds,
-                )
-                return "unsupported"
-        logger.info("chunk reuse: unsupported cache kinds=%s; disabling", kinds)
-        return "unsupported"  # sliding-window / rotating / mamba, etc.
+        except Exception as e:  # noqa: BLE001
+            logger.info("chunk reuse: arch unsupported (%s); disabling", e)
+            return "unsupported"
 
     @property
     def supported(self) -> bool:
