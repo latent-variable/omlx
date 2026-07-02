@@ -10396,6 +10396,9 @@ class Scheduler:
                 counters
             )
 
+        if self.chunk_reuse_engine is not None:
+            stats["chunk_reuse"] = self.chunk_reuse_engine.stats()
+
         return stats if stats else None
 
     # Alias for backwards compatibility
