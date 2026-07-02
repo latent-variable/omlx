@@ -152,6 +152,17 @@ class ChunkReuseEngine:
         Order: hybrid (qwen3_5-style linear+attention) first, then full-attn,
         else unsupported (sliding-window / rotating / mamba).
         """
+        # oMLX loads several model families (Qwen3.6 MTP/oQ hybrids) through
+        # mlx-vlm, whose attention exposes an M-RoPE `rotary_emb` rather than
+        # the stock mlx-lm `.rope` that the re-rotation targets. Detect that
+        # runtime and decline cleanly (chunk reuse is a no-op; normal prefill
+        # runs) — supporting it needs the mlx-vlm rotary adaptation.
+        if self._uses_mlx_vlm_rotary(model):
+            logger.info(
+                "chunk reuse: model uses mlx-vlm M-RoPE rotary (rotary_emb), "
+                "not yet supported by chunk reuse; disabling (normal prefill runs)"
+            )
+            return "unsupported"
         try:
             crh.get_hybrid_layout(model)  # raises unless qwen3_5-style hybrid
             return "hybrid"
@@ -163,6 +174,20 @@ class ChunkReuseEngine:
         except Exception as e:  # noqa: BLE001
             logger.info("chunk reuse: arch unsupported (%s); disabling", e)
             return "unsupported"
+
+    @staticmethod
+    def _uses_mlx_vlm_rotary(model) -> bool:
+        """True if attention layers expose mlx-vlm's `rotary_emb` (M-RoPE)
+        rather than stock mlx-lm's `.rope`."""
+        try:
+            layers = cr.inner_module(model).layers
+            for l in layers:
+                attn = getattr(l, "self_attn", None) or getattr(l, "attention", None)
+                if attn is not None:
+                    return hasattr(attn, "rotary_emb") and not hasattr(attn, "rope")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     @property
     def supported(self) -> bool:
