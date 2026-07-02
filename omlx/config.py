@@ -123,6 +123,28 @@ class PagedSSDCacheConfig:
 
 
 @dataclass
+class ChunkReuseConfig:
+    """Position-independent KV chunk reuse (experimental, opt-in).
+
+    Reuses a chunk's KV (and, for hybrid models, the linear-attention layer's
+    per-token inputs) across contexts where the standard prefix cache misses,
+    correcting position with RoPE re-rotation and recomputing a small fraction
+    of tokens. Orthogonal to the prefix cache: only activates on prefix-cache
+    misses over content whose chunks exist in the store.
+    """
+
+    enabled: bool = False
+    # recompute policy: "edge" (leading tokens) is cheapest and best on MoE;
+    # "devblock" selects high-deviation blocks (better on dense models).
+    recompute_mode: str = "edge"
+    edge_tokens: int = 32
+    deviation_ratio: float = 0.15
+    dev_block: int = 32
+    # minimum chunk length (tokens) worth storing/reusing
+    min_chunk_tokens: int = 128
+
+
+@dataclass
 class MCPConfig:
     """MCP (Model Context Protocol) configuration."""
 
@@ -145,6 +167,7 @@ class OMLXConfig:
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
     paged_ssd_cache: PagedSSDCacheConfig = field(default_factory=PagedSSDCacheConfig)
+    chunk_reuse: ChunkReuseConfig = field(default_factory=ChunkReuseConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
 
     # Feature flags
@@ -187,6 +210,14 @@ class OMLXConfig:
             config.paged_ssd_cache.max_size = os.getenv(
                 "OMLX_PAGED_SSD_CACHE_MAX_SIZE", config.paged_ssd_cache.max_size
             )
+
+        # Chunk reuse settings (experimental, opt-in)
+        config.chunk_reuse.enabled = os.getenv(
+            "OMLX_CHUNK_REUSE", "false"
+        ).lower() == "true"
+        config.chunk_reuse.recompute_mode = os.getenv(
+            "OMLX_CHUNK_REUSE_MODE", config.chunk_reuse.recompute_mode
+        )
 
         # MCP settings
         mcp_config = os.getenv("OMLX_MCP_CONFIG")
