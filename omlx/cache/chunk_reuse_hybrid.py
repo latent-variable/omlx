@@ -295,9 +295,10 @@ def hybrid_blended_prefill(
                 stats.reused_tokens += e - s
         pos += L
 
-    last_logits = _forward(model, suffix_tokens, caches)
+    # Empty suffix = engine mode: caller (oMLX) prefills the suffix itself.
+    last_logits = _forward(model, suffix_tokens, caches) if suffix_tokens else None
     pos += len(suffix_tokens)
-    mx.eval([c.state for c in caches])
+    mx.eval([c.state for c in caches if c.state])
     stats.prefill_seconds = time.perf_counter() - t0
     stats.total_tokens = pos
     return caches, last_logits, stats
