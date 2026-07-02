@@ -1789,6 +1789,34 @@ class Scheduler:
                 "oMLX cache disabled (mlx-lm BatchGenerator manages KV internally)"
             )
 
+        # Position-independent chunk reuse (experimental, opt-in). Serves the
+        # prefix-cache misses agents hit constantly: same content re-read at a
+        # different position / under a different prefix. Its own namespace;
+        # never writes to the paged SSD store (guarded by request._chunk_reuse).
+        self.chunk_reuse_engine = None
+        cr_cfg = getattr(self.config, "chunk_reuse", None)
+        if cr_cfg is not None and getattr(cr_cfg, "enabled", False):
+            try:
+                from .cache.chunk_reuse_engine import ChunkReuseEngine
+
+                self.chunk_reuse_engine = ChunkReuseEngine(
+                    model, self.config.model_name, cr_cfg
+                )
+                if self.chunk_reuse_engine.supported:
+                    logger.info(
+                        "chunk reuse enabled (arch=%s, mode=%s)",
+                        self.chunk_reuse_engine.arch, cr_cfg.recompute_mode,
+                    )
+                else:
+                    logger.info(
+                        "chunk reuse requested but arch unsupported (%s); disabled",
+                        self.chunk_reuse_engine.arch,
+                    )
+                    self.chunk_reuse_engine = None
+            except Exception as e:  # noqa: BLE001
+                logger.warning("chunk reuse init failed (%s); disabled", e)
+                self.chunk_reuse_engine = None
+
         # Streaming detokenizers for proper UTF-8 handling (one per active request)
         # NOTE: No pooling - each request gets a fresh instance to prevent state contamination
         self._request_detokenizers: dict[str, Any] = (
@@ -2920,6 +2948,7 @@ class Scheduler:
         boundary_enabled = (
             block_size > 0
             and self.block_aware_cache is not None
+            and not getattr(request, "_chunk_reuse", False)
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
@@ -3911,6 +3940,7 @@ class Scheduler:
         boundary_enabled = (
             block_size > 0
             and self.block_aware_cache is not None
+            and not getattr(request, "_chunk_reuse", False)
             and _prompt_cache_needs_snapshots(prompt_cache)
         )
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
@@ -5945,10 +5975,52 @@ class Scheduler:
         if logger.isEnabledFor(logging.DEBUG):
             self._log_prefix_divergence(request)
 
+        # Chunk reuse: on a prefix-cache miss (nothing cached), try to assemble
+        # a prompt cache from stored content chunks appearing at non-prefix
+        # positions. Runs in its own namespace and never touches the paged SSD
+        # store (marked via request._chunk_reuse so store-back/boundary-snapshot
+        # paths skip it).
+        self._try_chunk_reuse(request)
+
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
+
+    def _try_chunk_reuse(self, request: Request) -> None:
+        """Assemble request.prompt_cache from stored chunks on a prefix miss."""
+        engine = self.chunk_reuse_engine
+        if engine is None:
+            return
+        # Only on a full miss: prefix cache produced no cached tokens.
+        if getattr(request, "cached_tokens", 0):
+            return
+        if getattr(request, "block_table", None) is not None:
+            return
+        # Text-only for now (VLM extra-keys not yet threaded through chunks).
+        if getattr(request, "vlm_extra_keys_for_cache", None):
+            return
+        prompt_ids = request.prompt_token_ids
+        if not prompt_ids or len(prompt_ids) < engine.config.min_chunk_tokens:
+            return
+        try:
+            result = engine.assemble(list(prompt_ids))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("chunk reuse assemble error (%s); full prefill", e)
+            return
+        if result is None or result.cached_tokens <= 0:
+            return
+        request.prompt_cache = result.prompt_cache
+        request.cached_tokens = result.cached_tokens
+        request.remaining_tokens = list(prompt_ids[result.cached_tokens:])
+        request._chunk_reuse = True
+        logger.info(
+            "chunk reuse hit for %s: %d chunks, %d/%d tokens assembled "
+            "(%.0f%% recompute), %d tokens remaining",
+            request.request_id, result.chunks_used, result.cached_tokens,
+            len(prompt_ids), result.recompute_fraction * 100,
+            len(request.remaining_tokens),
+        )
 
     def add_request(self, request: Request) -> None:
         """
@@ -8448,6 +8520,30 @@ class Scheduler:
                 # Extract cache for future reuse.
                 # In the new API, prompt_cache is a direct value (not callable).
                 raw_cache = getattr(response, "prompt_cache", None)
+
+                # Chunk reuse capture: store this prompt's content chunks so a
+                # later request re-reading the same content (new session /
+                # shifted position) can reuse them. Independent of the paged
+                # SSD store; slices the prompt portion of the finished cache
+                # (full-attn) or reruns a recording prefill (hybrid).
+                if (
+                    self.chunk_reuse_engine is not None
+                    and raw_cache is not None
+                    and request.prompt_token_ids
+                    and request.specprefill_indices is None
+                    and not getattr(request, "_chunk_reuse", False)
+                ):
+                    try:
+                        n = self.chunk_reuse_engine.capture(
+                            list(request.prompt_token_ids), raw_cache
+                        )
+                        if n:
+                            logger.debug(
+                                "chunk reuse captured %d chunks from %s", n, request_id
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("chunk reuse capture failed for %s: %s", request_id, e)
+
                 if raw_cache is not None:
                     try:
                         # SpecPrefill: sparse KV data can't be stored in
@@ -8555,7 +8651,11 @@ class Scheduler:
             # picked up at the next step's _drain_pending_async_removes.
             store_future = None
             if request is not None and request.prompt_token_ids:
-                if self.block_aware_cache is not None:
+                # Chunk-reuse-assembled caches are not paged block tables and
+                # have no block_table; never push them into the paged SSD store.
+                if self.block_aware_cache is not None and not getattr(
+                    request, "_chunk_reuse", False
+                ):
                     if (
                         hasattr(request, "_extracted_cache")
                         and request._extracted_cache is not None
@@ -9488,9 +9588,13 @@ class Scheduler:
 
     def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
+        stats = None
         if self.block_aware_cache is not None:
-            return self.block_aware_cache.get_stats()
-        return None
+            stats = self.block_aware_cache.get_stats()
+        if self.chunk_reuse_engine is not None:
+            stats = dict(stats or {})
+            stats["chunk_reuse"] = self.chunk_reuse_engine.stats()
+        return stats
 
     def reset(self) -> None:
         """Reset the scheduler state."""
