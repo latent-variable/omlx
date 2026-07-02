@@ -144,20 +144,26 @@ class ChunkReuseEngine:
     def _detect_arch(self, model) -> str:
         try:
             caches = model.make_cache() if hasattr(model, "make_cache") else None
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.info("chunk reuse: make_cache() failed (%s); assuming full-attn", e)
             caches = None
         if caches is None:
             return "full"  # plain KVCache default
-        kinds = {type(c).__name__ for c in caches}
-        if kinds <= {"KVCache"}:
+        kinds = sorted({type(c).__name__ for c in caches})
+        if set(kinds) <= {"KVCache"}:
             return "full"
-        if kinds <= {"KVCache", "ArraysCache"}:
+        if set(kinds) <= {"KVCache", "ArraysCache"}:
             # hybrid — confirm the qwen3_5 layout is introspectable
             try:
                 crh.get_hybrid_layout(model)
                 return "hybrid"
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                logger.info(
+                    "chunk reuse: hybrid layout introspection failed (%s); "
+                    "cache kinds=%s; disabling", e, kinds,
+                )
                 return "unsupported"
+        logger.info("chunk reuse: unsupported cache kinds=%s; disabling", kinds)
         return "unsupported"  # sliding-window / rotating / mamba, etc.
 
     @property

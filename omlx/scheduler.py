@@ -1793,8 +1793,18 @@ class Scheduler:
         # prefix-cache misses agents hit constantly: same content re-read at a
         # different position / under a different prefix. Its own namespace;
         # never writes to the paged SSD store (guarded by request._chunk_reuse).
+        # Config resolution: a `chunk_reuse` object on self.config if present
+        # (config.py path), else the OMLX_CHUNK_REUSE* env vars (server path,
+        # which builds a SchedulerConfig without this field).
         self.chunk_reuse_engine = None
         cr_cfg = getattr(self.config, "chunk_reuse", None)
+        if cr_cfg is None and os.getenv("OMLX_CHUNK_REUSE", "false").lower() == "true":
+            from .config import ChunkReuseConfig
+
+            cr_cfg = ChunkReuseConfig(
+                enabled=True,
+                recompute_mode=os.getenv("OMLX_CHUNK_REUSE_MODE", "edge"),
+            )
         if cr_cfg is not None and getattr(cr_cfg, "enabled", False):
             try:
                 from .cache.chunk_reuse_engine import ChunkReuseEngine

@@ -59,12 +59,22 @@ def chat(base, key, model, system, user, max_tokens=32):
     data, wall = _post(base, key, "/v1/chat/completions", body)
     usage = data.get("usage", {})
     text = data["choices"][0]["message"]["content"]
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+    pt = usage.get("prompt_tokens") or 0
     return {
         "wall_s": wall,
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "prompt_tps": usage.get("prompt_tokens_per_second"),
+        "prompt_tokens": pt,
+        "cached_tokens": cached,
+        "cached_pct": (100.0 * cached / pt) if pt else 0.0,
+        "total_time": usage.get("total_time"),
         "text": text[:80],
     }, data
+
+
+def _row(label, r):
+    return (f"{label}: prompt_tokens={r['prompt_tokens']} "
+            f"cached={r['cached_tokens']} ({r['cached_pct']:.0f}%) "
+            f"wall={r['wall_s']:.2f}s :: {r['text']!r}")
 
 
 def main():
@@ -76,11 +86,7 @@ def main():
     base, key, model = args.base_url, args.api_key, args.model
 
     files_a = _file_block("prefix_cache.py", 200) + _file_block("paged_cache.py", 200)
-    files_c = _file_block("scheduler.py", 400)  # unique control content
-
-    def stats():
-        s = _get(base, key, "/admin/api/cache/stats") if _has_admin(base, key) else None
-        return s
+    files_c = _file_block("paged_ssd_cache.py", 400)  # unique control content
 
     print(f"model={model}\n")
 
@@ -89,8 +95,7 @@ def main():
                 "You are a coding agent debugging cache behavior.",
                 "Here are the files:\n" + files_a +
                 "\nBriefly: what does compute_block_hash use?")
-    print(f"A (cold, populates store): prompt_tokens={a['prompt_tokens']} "
-          f"prompt_tps={a['prompt_tps']:.0f} wall={a['wall_s']:.2f}s :: {a['text']!r}")
+    print(_row("A (cold, populates store)   ", a))
 
     time.sleep(1)
 
@@ -100,33 +105,47 @@ def main():
                 "You are a meticulous reviewer doing a fresh audit. Keep it short.",
                 "New session. Re-examine these modules:\n" + files_a +
                 "\nWhat is the block size in prefix_cache.py?")
-    print(f"B (reuse, same files new session): prompt_tokens={b['prompt_tokens']} "
-          f"prompt_tps={b['prompt_tps']:.0f} wall={b['wall_s']:.2f}s :: {b['text']!r}")
+    print(_row("B (reuse: same files, new sess)", b))
 
     # Control C: same-size prompt but UNIQUE content (no reuse possible).
     c, _ = chat(base, key, model,
                 "You are a meticulous reviewer doing a fresh audit. Keep it short.",
                 "New session. Re-examine this module:\n" + files_c +
-                "\nWhat does the scheduler's add_request do?")
-    print(f"C (control, unique content): prompt_tokens={c['prompt_tokens']} "
-          f"prompt_tps={c['prompt_tps']:.0f} wall={c['wall_s']:.2f}s :: {c['text']!r}")
+                "\nWhat does the scheduler add_request do?")
+    print(_row("C (control: unique content)  ", c))
 
     print("\n--- interpretation ---")
-    if b["prompt_tps"] and c["prompt_tps"]:
-        print(f"B effective prompt throughput / C (no-reuse) = "
-              f"{b['prompt_tps'] / c['prompt_tps']:.1f}x")
-    sc = stats()
-    if sc:
-        print("\nserver cache stats (chunk_reuse):")
-        print(json.dumps(sc.get("chunk_reuse", sc), indent=2))
+    print(f"B cached {b['cached_pct']:.0f}% of its prompt via chunk reuse; "
+          f"control C cached {c['cached_pct']:.0f}%.")
+    if b["wall_s"] and c["wall_s"] and abs(b['prompt_tokens'] - c['prompt_tokens']) < 400:
+        print(f"B wall {b['wall_s']:.2f}s vs C {c['wall_s']:.2f}s "
+              f"(similar prompt size) → {c['wall_s']/b['wall_s']:.2f}x")
 
-
-def _has_admin(base, key):
+    # Best-effort: dig chunk_reuse stats out of the admin observability blob.
     try:
-        _get(base, key, "/admin/api/cache/stats")
-        return True
+        blob = _get(base, key, "/admin/api/stats")
+        found = _find_key(blob, "chunk_reuse")
+        if found:
+            print("\nserver chunk_reuse stats:")
+            print(json.dumps(found, indent=2))
     except Exception:
-        return False
+        pass
+
+
+def _find_key(obj, target):
+    if isinstance(obj, dict):
+        if target in obj:
+            return obj[target]
+        for v in obj.values():
+            r = _find_key(v, target)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, target)
+            if r is not None:
+                return r
+    return None
 
 
 if __name__ == "__main__":
