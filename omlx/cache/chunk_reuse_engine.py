@@ -38,6 +38,7 @@ from mlx_lm.models.cache import ArraysCache, KVCache
 
 from . import chunk_reuse as cr
 from . import chunk_reuse_hybrid as crh
+from . import chunk_reuse_vlm as crv
 
 logger = logging.getLogger(__name__)
 
@@ -154,15 +155,19 @@ class ChunkReuseEngine:
         """
         # oMLX loads several model families (Qwen3.6 MTP/oQ hybrids) through
         # mlx-vlm, whose attention exposes an M-RoPE `rotary_emb` rather than
-        # the stock mlx-lm `.rope` that the re-rotation targets. Detect that
-        # runtime and decline cleanly (chunk reuse is a no-op; normal prefill
-        # runs) — supporting it needs the mlx-vlm rotary adaptation.
+        # stock mlx-lm's `.rope`. qwen3_5-style hybrids there are supported
+        # via the vlm adaptation (text-only M-RoPE collapses to standard
+        # RoPE); other mlx-vlm archs decline cleanly (normal prefill runs).
         if self._uses_mlx_vlm_rotary(model):
-            logger.info(
-                "chunk reuse: model uses mlx-vlm M-RoPE rotary (rotary_emb), "
-                "not yet supported by chunk reuse; disabling (normal prefill runs)"
-            )
-            return "unsupported"
+            try:
+                crv.get_vlm_hybrid_layout(model)
+                return "vlm_hybrid"
+            except Exception as e:  # noqa: BLE001
+                logger.info(
+                    "chunk reuse: mlx-vlm arch unsupported (%s); disabling "
+                    "(normal prefill runs)", e,
+                )
+                return "unsupported"
         try:
             crh.get_hybrid_layout(model)  # raises unless qwen3_5-style hybrid
             return "hybrid"
@@ -191,7 +196,7 @@ class ChunkReuseEngine:
 
     @property
     def supported(self) -> bool:
-        return self.arch in ("full", "hybrid")
+        return self.arch in ("full", "hybrid", "vlm_hybrid")
 
     # -- capture ------------------------------------------------------------
 
@@ -223,9 +228,10 @@ class ChunkReuseEngine:
             return 0
 
         recording = None
-        if self.arch == "hybrid":
+        if self.arch in ("hybrid", "vlm_hybrid"):
+            mod = crh if self.arch == "hybrid" else crv
             try:
-                recording = crh.capture_prefill(self.model, prompt_ids)
+                recording = mod.capture_prefill(self.model, prompt_ids)
             except Exception as e:  # noqa: BLE001
                 logger.debug("hybrid recording prefill failed: %s", e)
                 return 0
@@ -240,6 +246,9 @@ class ChunkReuseEngine:
                 try:
                     if self.arch == "hybrid":
                         chunk = crh.extract_hybrid_chunk(recording, prompt_ids, s, e)
+                        self._store[key] = _StoredChunk(prompt_ids[s:e], s, chunk, True)
+                    elif self.arch == "vlm_hybrid":
+                        chunk = crv.extract_vlm_chunk(recording, prompt_ids, s, e)
                         self._store[key] = _StoredChunk(prompt_ids[s:e], s, chunk, True)
                     else:
                         kv = cr.extract_chunk_kv(prompt_cache, s, e)
@@ -302,13 +311,15 @@ class ChunkReuseEngine:
 
         mode = self.config.recompute_mode
         try:
-            if self.arch == "hybrid":
+            if self.arch in ("hybrid", "vlm_hybrid"):
                 hchunks = [sc.payload for sc in chunks]
-                # hybrid path has no interleave arg yet; require contiguous chunks
+                # hybrid paths have no interleave arg yet; require contiguous chunks
                 if any(seg for seg in interleave):
                     self.assemble_misses += 1
                     return None
-                caches, _, stats = crh.hybrid_blended_prefill(
+                blend = (crh.hybrid_blended_prefill if self.arch == "hybrid"
+                         else crv.vlm_blended_prefill)
+                caches, _, stats = blend(
                     self.model, prefix, hchunks, [],  # empty suffix; we prefill it via oMLX
                     mode=mode, edge_k=self.config.edge_tokens,
                     deviation_ratio=self.config.deviation_ratio,
