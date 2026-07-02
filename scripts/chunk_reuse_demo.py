@@ -19,6 +19,7 @@ import argparse
 import json
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "omlx" / "cache"
@@ -88,11 +89,16 @@ def main():
     files_a = _file_block("prefix_cache.py", 200) + _file_block("paged_cache.py", 200)
     files_c = _file_block("paged_ssd_cache.py", 400)  # unique control content
 
-    print(f"model={model}\n")
+    # Per-run nonce in the system prompts so the persistent paged SSD prefix
+    # cache from *previous* demo runs can't serve these prompts — isolates
+    # what THIS run's chunk store contributes.
+    nonce = uuid.uuid4().hex[:8]
+
+    print(f"model={model} nonce={nonce}\n")
 
     # Session A: read the files, populate the chunk store.
     a, _ = chat(base, key, model,
-                "You are a coding agent debugging cache behavior.",
+                f"[session {nonce}-a] You are a coding agent debugging cache behavior.",
                 "Here are the files:\n" + files_a +
                 "\nBriefly: what does compute_block_hash use?")
     print(_row("A (cold, populates store)   ", a))
@@ -102,14 +108,14 @@ def main():
     # Session B: NEW session (different system + question), SAME files.
     # Prefix cache misses (different prefix); chunk reuse should hit.
     b, _ = chat(base, key, model,
-                "You are a meticulous reviewer doing a fresh audit. Keep it short.",
+                f"[session {nonce}-b] You are a meticulous reviewer doing a fresh audit. Keep it short.",
                 "New session. Re-examine these modules:\n" + files_a +
                 "\nWhat is the block size in prefix_cache.py?")
     print(_row("B (reuse: same files, new sess)", b))
 
     # Control C: same-size prompt but UNIQUE content (no reuse possible).
     c, _ = chat(base, key, model,
-                "You are a meticulous reviewer doing a fresh audit. Keep it short.",
+                f"[session {nonce}-c] You are a meticulous reviewer doing a fresh audit. Keep it short.",
                 "New session. Re-examine this module:\n" + files_c +
                 "\nWhat does the scheduler add_request do?")
     print(_row("C (control: unique content)  ", c))

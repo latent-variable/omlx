@@ -33,29 +33,49 @@ state; the recurrence is position-free so no re-rotation is needed there.
 | Llama-3.1-8B (full-attn) | devblock | 15% | 3.5x | 5/5 |
 | Qwen3.6-35B-A3B (hybrid) | edge | 3% | 3.0x | 5/5 |
 
+## Results (end-to-end, live server, chunk reuse ON, 2026-07-02)
+
+New-session prompt sharing ~3.4k tokens of file content with a prior
+session (prefix cache misses; chunk reuse assembles):
+
+| model | cached | wall vs cold | quality |
+|---|---|---|---|
+| Qwen3.6-35B-A3B-8bit | 98–99% | 2.24s → ~1.0s (~2.2x) | 3/3 factual Qs match baseline |
+| Qwen3.6-27B-oQ4-mtp | 99% | ~10.4s → 2.86s (~3x) | 3/3 factual Qs match baseline |
+
+Cold/donor requests include the capture recording prefill (hybrids rerun a
+recording forward to grab linear-layer inputs), roughly doubling novel-prompt
+prefill; skip-first-sight / async capture is the obvious follow-up.
+
 ## Files
 
 - `chunk_reuse.py` — full-attention path (extract / re-rotate / blended prefill)
 - `chunk_reuse_hybrid.py` — hybrid path (linear-input replay + KV transplant)
+- `chunk_reuse_vlm.py` — same hybrid mechanism on the mlx-vlm runtime
+  (M-RoPE `rotary_emb`; how oMLX actually serves Qwen3.5/3.6 incl. MTP/oQ)
+- `chunk_reuse_engine.py` — content-defined chunk store + capture/assemble
 - `config.py::ChunkReuseConfig` — the toggle and recompute policy
 
-## Integration plan (this branch)
+## Integration status (this branch)
 
-- [x] Config flag + env override, default off
+- [x] Config flag + env override (`OMLX_CHUNK_REUSE`), default off
 - [x] Port validated mechanism into the package
-- [ ] Content-hash chunk index alongside the paged block store (reuse the
-      existing SSD format; chunk = block sequence keyed by content hash)
-- [ ] Scheduler hook: on prefix-cache miss, look up chunks, assemble via
+- [x] Content-hash chunk index (gear-hash CDC; in-memory, per-model)
+- [x] Scheduler hook: on prefix-cache miss, look up chunks, assemble via
       blended prefill instead of full prefill
-- [ ] Arch gating: full-attn → `chunk_reuse`, hybrid → `chunk_reuse_hybrid`,
-      sliding-window (gemma4) → decline (fall back to prefix cache)
-- [ ] MTP: verify draft path reads reused caches unchanged at decode
+- [x] Arch gating: full-attn / hybrid / vlm_hybrid; sliding-window (gemma4)
+      and unknown archs decline (normal prefill runs)
+- [x] MTP: 27B-oQ4-mtp generates correctly from assembled caches (e2e)
+- [ ] Persist chunk store to SSD (currently in-memory, lost on restart)
+- [ ] Capture cost: skip-first-sight or async recording prefill
+- [ ] Upstream the mlx-vlm capture/replay primitives (long-term home)
 
 ## Constraints
 
-- Full-attention and qwen3_5-hybrid only. gemma4 sliding-window not yet
-  supported (window makes reuse local — a future LegoLink-at-window variant).
+- Full-attention and qwen3_5-hybrid (mlx-lm or mlx-vlm runtime) only.
+  gemma4 sliding-window not yet supported (window makes reuse local — a
+  future LegoLink-at-window variant).
+- Text-only prompts for now (image spans decline; M-RoPE rigid-shift makes
+  them feasible later).
 - Quality is opt-in / approximate: facts hold, exact wording drifts. Not
   bit-exact generation.
-- The 27B's oQ4e quant only decodes inside oMLX, so it is validated here (in
-  the engine) rather than standalone.
