@@ -210,6 +210,43 @@ def _safe_sync_stream(stream=None):
             raise
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid integer env %s=%r", name, value)
+        return default
+
+
+def _collect_mx_arrays(value, out: list[mx.array]) -> None:
+    if isinstance(value, mx.array):
+        out.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_mx_arrays(item, out)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_mx_arrays(item, out)
+
+
+def _eval_generation_batch_cache(batch_generator) -> int:
+    generation_batch = getattr(batch_generator, "_generation_batch", None)
+    prompt_cache = getattr(generation_batch, "prompt_cache", None)
+    if not prompt_cache:
+        return 0
+    arrays: list[mx.array] = []
+    for cache in prompt_cache:
+        state = getattr(cache, "state", None)
+        if state is not None:
+            _collect_mx_arrays(state, arrays)
+    if arrays:
+        mx.eval(*arrays)
+    return len(arrays)
+
+
 class _StoreCacheGate:
     """Non-blocking counter that bounds in-flight store-cache submissions.
 
@@ -272,13 +309,14 @@ class _StoreCacheGate:
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
     from .cache.paged_ssd_cache import PagedSSDCacheManager
-    from .memory_monitor import MemoryMonitor
+    from .memory_monitor import MemoryMonitor, estimate_mla_kv_bytes_per_token
 
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
     BoundarySnapshotSSDStore = None
     MemoryMonitor = None
+    estimate_mla_kv_bytes_per_token = None
     HAS_TIERED_CACHE = False
 
 # Import cache type handlers for hybrid cache support
@@ -883,6 +921,10 @@ def _patched_ppb_split(self, indices):
         new_batch.logits_processors = lps
         new_batch.state_machines = self.state_machines
         new_batch.max_tokens = self.max_tokens
+        if hasattr(self, "_omlx_glm_dsa_adaptive_prefill"):
+            new_batch._omlx_glm_dsa_adaptive_prefill = (
+                self._omlx_glm_dsa_adaptive_prefill
+            )
 
         self.uids = []
         self.prompt_cache = []
@@ -1446,6 +1488,48 @@ class Scheduler:
         self._turboquant_skip_last: bool = True
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
+        self._glm_dsa_adaptive_prefill = None
+        try:
+            from .patches.glm_moe_dsa.generate_patch import (
+                _glm_dsa_adaptive_prefill_config,
+            )
+
+            self._glm_dsa_adaptive_prefill = _glm_dsa_adaptive_prefill_config(
+                model, self.config.prefill_step_size
+            )
+        except Exception:
+            logger.debug("GLM DSA adaptive prefill config unavailable", exc_info=True)
+        if self._glm_dsa_adaptive_prefill is not None:
+            logger.info(
+                "GLM DSA adaptive scheduler prefill enabled: step=%d after=%d "
+                "min_remaining=%d",
+                self._glm_dsa_adaptive_prefill.step_size,
+                self._glm_dsa_adaptive_prefill.after,
+                self._glm_dsa_adaptive_prefill.min_remaining,
+            )
+        self._minimax_m3_adaptive_prefill = None
+        try:
+            from .patches.minimax_m3.generate_patch import (
+                _minimax_m3_adaptive_prefill_config,
+            )
+
+            self._minimax_m3_adaptive_prefill = _minimax_m3_adaptive_prefill_config(
+                model,
+                self.config.prefill_step_size,
+                getattr(self.config, "model_name", None),
+            )
+        except Exception:
+            logger.debug(
+                "MiniMax M3 adaptive prefill config unavailable", exc_info=True
+            )
+        if self._minimax_m3_adaptive_prefill is not None:
+            logger.info(
+                "MiniMax M3 adaptive scheduler prefill enabled: step=%d after=%d "
+                "min_remaining=%d",
+                self._minimax_m3_adaptive_prefill.step_size,
+                self._minimax_m3_adaptive_prefill.after,
+                self._minimax_m3_adaptive_prefill.min_remaining,
+            )
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -1511,6 +1595,7 @@ class Scheduler:
         self._admission_paused: bool = False
         # Adaptive prefill throttle params, propagated from enforcer.
         # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
+        self._prefill_headroom_safety: float = self._PREFILL_HEADROOM_SAFETY
         self._prefill_safe_zone_ratio: float = 0.80
         self._prefill_min_chunk_tokens: int = 256
         self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
@@ -1538,6 +1623,22 @@ class Scheduler:
         # token where the new prompt diverges from what was cached.
         # Populated only when debug logging is enabled — zero cost otherwise.
         self._cache_probe_seqs: deque[tuple[str, list[int]]] = deque(maxlen=4)
+
+        model_name_lower = (self.config.model_name or "").lower()
+        default_kv_eval_interval = 256 if "minimax" in model_name_lower else 0
+        self._decode_eval_kv_cache_interval: int = max(
+            0,
+            _env_int(
+                "OMLX_DECODE_EVAL_KV_CACHE_INTERVAL",
+                default_kv_eval_interval,
+            ),
+        )
+        self._tokens_since_kv_cache_eval: int = 0
+        if self._decode_eval_kv_cache_interval > 0:
+            logger.info(
+                "Decode KV cache materialization interval set to %d tokens",
+                self._decode_eval_kv_cache_interval,
+            )
 
         # VLM MTP: gemma4_assistant drafter attached by VLMBatchedEngine.
         # When set, eligible requests bypass mlx-lm BatchGenerator for decode
@@ -2068,7 +2169,12 @@ class Scheduler:
                 self._collect_rotating_window_sizes(sub_cache, window_sizes)
 
         class_name = type(cache_obj).__name__
-        if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
+        is_rotating_cache = class_name in ("RotatingKVCache", "BatchRotatingKVCache")
+        if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+            is_rotating_cache = (
+                is_rotating_cache or CacheTypeRegistry.is_rotating_family(class_name)
+            )
+        if is_rotating_cache:
             max_size = getattr(cache_obj, "max_size", 0)
             if isinstance(max_size, int) and max_size > 0:
                 window_sizes.add(max_size)
@@ -2650,6 +2756,7 @@ class Scheduler:
                 "RotatingKVCache",
                 "BatchRotatingKVCache",
                 "PrefillReadyRotatingKVCache",
+                "BufferedRotatingKVCache",
                 "TurboQuantKVCache",
                 "BatchTurboQuantKVCache",
             ):
@@ -2869,13 +2976,15 @@ class Scheduler:
 
         input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
         processed_tokens = 0
-        prefill_step_size = self.config.prefill_step_size
         uid = self.request_id_to_uid.get(request.request_id)
 
         emitted_boundaries: dict[int, int] = {}
 
         while input_arr.shape[1] > 0:
             remaining = input_arr.shape[1]
+            prefill_step_size = self._prefill_step_size_for_progress(
+                processed_tokens, remaining
+            )
             n_to_process = min(prefill_step_size, remaining)
 
             if processed_tokens == 0:
@@ -3368,7 +3477,10 @@ class Scheduler:
         # Keep each chunk's predicted peak under the LOWER of the dynamic
         # throttle target and the prefill safety cap, so the peak can never
         # reach the Metal wall (the uncatchable async OOM).
-        safe_target = int(hard_cap * self._PREFILL_HEADROOM_SAFETY)
+        headroom_safety = getattr(
+            self, "_prefill_headroom_safety", self._PREFILL_HEADROOM_SAFETY
+        )
+        safe_target = int(hard_cap * headroom_safety)
         abort_cap = self._prefill_abort_cap()
         target = min(safe_target, abort_cap) if abort_cap > 0 else safe_target
         soft_watermark = int(soft_base * self._prefill_safe_zone_ratio)
@@ -3743,6 +3855,37 @@ class Scheduler:
     # Chunked prefill helpers (used when config.chunked_prefill=True)
     # ------------------------------------------------------------------
 
+    def _prefill_step_size_for_progress(
+        self, processed_tokens: int, remaining_tokens: int
+    ) -> int:
+        """Return the scheduler prefill chunk size for the current progress."""
+        adaptive_prefill = self._glm_dsa_adaptive_prefill
+        if adaptive_prefill is not None:
+            from .patches.glm_moe_dsa.generate_patch import (
+                _prefill_step_size_for_progress,
+            )
+
+            return _prefill_step_size_for_progress(
+                self.config.prefill_step_size,
+                processed_tokens,
+                remaining_tokens,
+                adaptive_prefill,
+            )
+
+        adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
+        if adaptive_prefill is None:
+            return self.config.prefill_step_size
+        from .patches.minimax_m3.generate_patch import (
+            _prefill_step_size_for_progress as _minimax_prefill_step_size,
+        )
+
+        return _minimax_prefill_step_size(
+            self.config.prefill_step_size,
+            processed_tokens,
+            remaining_tokens,
+            adaptive_prefill,
+        )
+
     def _begin_prefill(
         self,
         request: "Request",
@@ -3818,7 +3961,11 @@ class Scheduler:
         if state.tokens_remaining.shape[1] == 0:
             return True
 
-        n = min(self.config.prefill_step_size, state.tokens_remaining.shape[1])
+        remaining = state.tokens_remaining.shape[1]
+        prefill_step_size = self._prefill_step_size_for_progress(
+            state.tokens_processed, remaining
+        )
+        n = min(prefill_step_size, remaining)
 
         if state.tokens_processed == 0:
             _sync_and_clear_cache(self._stream)
@@ -4661,12 +4808,16 @@ class Scheduler:
             return False
 
         # Stateful non-sliceable caches require boundary-safe snapshots.
-        if class_name in (
+        is_rotating_cache = class_name in (
             "RotatingKVCache",
             "BatchRotatingKVCache",
-            "ArraysCache",
-            "SizedArraysCache",
-        ):
+        )
+        if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+            is_rotating_cache = (
+                is_rotating_cache or CacheTypeRegistry.is_rotating_family(class_name)
+            )
+
+        if is_rotating_cache or class_name in ("ArraysCache", "SizedArraysCache"):
             return True
 
         if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
@@ -5359,7 +5510,16 @@ class Scheduler:
                         state = layer_cache.state
                         meta = getattr(layer_cache, "meta_state", ())
 
-                    if class_name in ("RotatingKVCache", "BatchRotatingKVCache"):
+                    is_rotating_cache = class_name in (
+                        "RotatingKVCache",
+                        "BatchRotatingKVCache",
+                    )
+                    if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
+                        is_rotating_cache = (
+                            is_rotating_cache
+                            or CacheTypeRegistry.is_rotating_family(class_name)
+                        )
+                    if is_rotating_cache:
                         state, meta = self._normalize_rotating_snapshot_state(
                             layer_cache,
                             state,
@@ -5384,8 +5544,12 @@ class Scheduler:
                         # null guard for non-KV cache classes.
                         if (
                             class_name in ("KVCache", "RotatingKVCache", "BatchKVCache")
-                            and len(state) >= 2
-                        ):
+                            or (
+                                HAS_CACHE_TYPE_HANDLERS
+                                and CacheTypeRegistry is not None
+                                and CacheTypeRegistry.is_rotating_family(class_name)
+                            )
+                        ) and len(state) >= 2:
                             if state[0] is None or state[1] is None:
                                 logger.debug(
                                     f"Layer {layer_idx} ({class_name}) has None keys/values, "
@@ -5998,8 +6162,8 @@ class Scheduler:
             )
             return None
 
-        # Handle both LanguageModelOutput (dense models) and 3-tuple
-        # (logits, hidden, gdn_states) returned by the MoE MTP runtime patch.
+        # Handle current LanguageModelOutput and legacy tuple
+        # (logits, hidden, gdn_states) MTP runtime patch returns.
         if isinstance(out, tuple):
             logits = out[0][:, -1, :]
             hidden_raw = out[1]
@@ -8091,6 +8255,7 @@ class Scheduler:
         finished_ids = set()
 
         step_now = time.monotonic()
+        generated_at = time.perf_counter()
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
             if request_id is None:
@@ -8101,6 +8266,7 @@ class Scheduler:
                 continue
 
             request.last_activity_at = step_now
+            completion_tokens_before = request.num_output_tokens
 
             # Release VLM embeddings after first decode token (prefill is done)
             if request.vlm_inputs_embeds is not None:
@@ -8119,7 +8285,7 @@ class Scheduler:
             # Check if this request uses a protocol-specific output parser
             parser_session = self._get_output_parser_session(request_id)
 
-            if parser_session is not None:
+            if parser_session is not None and not is_stop:
                 parser_result = parser_session.process_token(response.token)
                 new_text = parser_result.stream_text
                 if parser_result.visible_text:
@@ -8205,6 +8371,11 @@ class Scheduler:
                 response.logprobs = None
 
             # Create output
+            output_generated_at = (
+                generated_at
+                if request.num_output_tokens > completion_tokens_before
+                else None
+            )
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
@@ -8212,6 +8383,8 @@ class Scheduler:
                 output_token_ids=list(request.output_token_ids),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                generated_at=output_generated_at,
+                generated_until=output_generated_at,
                 cached_tokens=request.cached_tokens,
             )
 
@@ -9106,6 +9279,30 @@ class Scheduler:
                     outputs, finished_ids = self._process_batch_responses(responses)
                     output.outputs.extend(outputs)
                     output.finished_request_ids.update(finished_ids)
+
+                    # Periodic decode cache materialization for models whose
+                    # KV cache update graph can otherwise grow for thousands of
+                    # tokens. MiniMax-M3 has one lazy cache-update chain per
+                    # layer; evaluating the cache state periodically cuts those
+                    # references before Metal's resource-count limit is hit.
+                    self._tokens_since_kv_cache_eval = getattr(
+                        self, "_tokens_since_kv_cache_eval", 0
+                    ) + len(responses)
+                    kv_eval_interval = self._decode_eval_kv_cache_interval
+                    if (
+                        kv_eval_interval > 0
+                        and self._tokens_since_kv_cache_eval >= kv_eval_interval
+                    ):
+                        with mx.stream(self._stream):
+                            evaluated = _eval_generation_batch_cache(
+                                self.batch_generator
+                            )
+                        logger.debug(
+                            "Materialized decode KV cache state: %d arrays",
+                            evaluated,
+                        )
+                        self._tokens_since_kv_cache_eval = 0
+
                     self._cleanup_finished(finished_ids)
 
                     # Periodic Metal allocator cleanup during long decodes.
@@ -9595,6 +9792,16 @@ class Scheduler:
                 else:
                     dtype_size = tq_dtype_size
 
+            kv_bytes_per_token = (
+                estimate_mla_kv_bytes_per_token(
+                    config,
+                    cache_list_for_tq,
+                    base_dtype_size,
+                )
+                if estimate_mla_kv_bytes_per_token is not None
+                else None
+            )
+
             # Truthiness alone isn't enough — MagicMock proxies leaking
             # through the descent (test scaffolds that don't fully spec
             # ``model.config``) are truthy but fail any later numeric
@@ -9614,6 +9821,7 @@ class Scheduler:
                     # SDPA scores are materialized at the compute/activation
                     # dtype, not the (possibly fractional TurboQuant) KV width.
                     compute_dtype_size=base_dtype_size,
+                    kv_bytes_per_token=kv_bytes_per_token,
                 )
                 logger.debug(
                     f"Model info for memory estimation: "
