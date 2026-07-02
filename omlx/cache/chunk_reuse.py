@@ -103,7 +103,7 @@ def get_layer_ropes(model) -> list:
     rotating / mamba state) — mirrors the same restriction oMLX applies to
     its own sliceable-cache paths.
     """
-    caches = model.make_cache() if hasattr(model, "make_cache") else [KVCache() for _ in model.model.layers]
+    caches = model.make_cache() if hasattr(model, "make_cache") else [KVCache() for _ in inner_module(model).layers]
     bad = [i for i, c in enumerate(caches) if not isinstance(c, KVCache)]
     if bad:
         raise ValueError(
@@ -111,7 +111,7 @@ def get_layer_ropes(model) -> list:
             "chunk reuse requires plain KVCache on every layer"
         )
     ropes = []
-    for layer in model.model.layers:
+    for layer in inner_module(model).layers:
         attn = getattr(layer, "self_attn", None) or getattr(layer, "attention", None)
         rope = getattr(attn, "rope", None)
         if rope is None:
@@ -124,10 +124,31 @@ def get_layer_ropes(model) -> list:
 # Cache plumbing
 # ---------------------------------------------------------------------------
 
+def unwrap_model(model):
+    """Return the real mlx-lm model, stripping oMLX's VLMModelAdapter wrapper.
+
+    oMLX wraps every model (text or VLM) in a VLMModelAdapter for
+    BatchGenerator compatibility; the adapter holds the real model on
+    ``_vlm_model``. Chunk reuse operates on the unwrapped model.
+    """
+    return getattr(model, "_vlm_model", model)
+
+
+def inner_module(model):
+    """Module holding embed_tokens / layers / norm.
+
+    Handles both flat models (qwen2/llama: ``model.model``) and the
+    language_model nesting used by qwen3_5-family and VLMs
+    (``model.language_model.model``). Assumes model is already unwrapped.
+    """
+    lm = getattr(model, "language_model", model)
+    return lm.model
+
+
 def make_caches(model) -> list:
     if hasattr(model, "make_cache"):
         return model.make_cache()  # correct per-layer types (incl. hybrids)
-    return [KVCache() for _ in range(len(model.model.layers))]
+    return [KVCache() for _ in range(len(inner_module(model).layers))]
 
 
 def copy_cache(cache: KVCache) -> KVCache:
@@ -223,8 +244,8 @@ def _probe_layer1_deviation(
     fresh post-RoPE keys against the re-rotated reused ones. ~2/28 of a full
     forward for this model.
     """
-    blocks = model.model.layers
-    h = model.model.embed_tokens(mx.array(chunk.tokens)[None])
+    blocks = inner_module(model).layers
+    h = inner_module(model).embed_tokens(mx.array(chunk.tokens)[None])
     probe_cache = copy_cache(caches[0])
 
     from mlx_lm.models.base import create_attention_mask

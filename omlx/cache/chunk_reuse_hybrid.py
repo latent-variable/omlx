@@ -29,6 +29,7 @@ from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.gated_delta import gated_delta_update
 
+from . import chunk_reuse as cr
 from .chunk_reuse import (
     BlendStats,
     _spans_from_indices,
@@ -43,7 +44,11 @@ from .chunk_reuse import (
 # ---------------------------------------------------------------------------
 
 def _lm(model):
-    """The text-model wrapper that owns args/head (qwen3_5 nests it)."""
+    """The text-model wrapper that owns args/head (qwen3_5 nests it).
+
+    Strips oMLX's VLMModelAdapter first, then the language_model nesting.
+    """
+    model = cr.unwrap_model(model)
     return getattr(model, "language_model", model)
 
 

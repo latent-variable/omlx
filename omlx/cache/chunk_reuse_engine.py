@@ -111,7 +111,9 @@ class ChunkReuseEngine:
     """Per-model chunk store + capture/assemble. Thread-safe (RLock)."""
 
     def __init__(self, model, model_name: str, config):
-        self.model = model
+        # Strip oMLX's VLMModelAdapter once; all forward/introspection uses the
+        # real mlx-lm model. Idempotent on already-unwrapped models.
+        self.model = cr.unwrap_model(model)
         self.model_name = model_name
         self.config = config
         # content-defined chunk sizing (tokens)
@@ -122,7 +124,7 @@ class ChunkReuseEngine:
         self._max_chunks = 4096
         self._lock = threading.RLock()
 
-        self.arch = self._detect_arch(model)
+        self.arch = self._detect_arch(self.model)
         # cached rope modules for the full-attention path
         self._ropes = None
         if self.arch == "full":
