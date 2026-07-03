@@ -4336,6 +4336,10 @@ def _build_runtime_cache_observability(
         if cache_rates:
             model_payload["cache_rates"] = cache_rates
 
+        chunk_reuse = runtime_stats.get("chunk_reuse")
+        if chunk_reuse:
+            model_payload["chunk_reuse"] = chunk_reuse
+
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
         payload["total_size_bytes"] += model_payload["total_size_bytes"]
