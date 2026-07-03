@@ -297,6 +297,8 @@ class CacheSettings:
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    chunk_reuse: bool = False  # experimental position-independent chunk reuse
+    chunk_reuse_mode: str = "edge"  # reuse | edge | devblock
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -340,6 +342,8 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "chunk_reuse": self.chunk_reuse,
+            "chunk_reuse_mode": self.chunk_reuse_mode,
         }
 
     @classmethod
@@ -356,6 +360,8 @@ class CacheSettings:
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+            chunk_reuse=bool(data.get("chunk_reuse", False)),
+            chunk_reuse_mode=data.get("chunk_reuse_mode", "edge"),
         )
 
 

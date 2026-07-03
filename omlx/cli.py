@@ -17,6 +17,7 @@ Usage:
 import argparse
 import faulthandler
 import math
+import os
 import sys
 
 from ._version import __version__
@@ -266,6 +267,16 @@ def serve_command(args):
 
         # Build scheduler config for BatchedEngine
         scheduler_config = settings.to_scheduler_config()
+
+        # Experimental chunk reuse: settings.json (cache.chunk_reuse) feeds
+        # the scheduler through the env channel it already reads; an
+        # explicitly set OMLX_CHUNK_REUSE env var wins over the settings file.
+        if settings.cache.chunk_reuse and "OMLX_CHUNK_REUSE" not in os.environ:
+            os.environ["OMLX_CHUNK_REUSE"] = "true"
+            os.environ.setdefault(
+                "OMLX_CHUNK_REUSE_MODE", settings.cache.chunk_reuse_mode
+            )
+
         # Set paged SSD cache options
         scheduler_config.paged_ssd_cache_dir = paged_ssd_cache_dir
         # Determine cache max size: CLI arg > settings (with auto resolution)
