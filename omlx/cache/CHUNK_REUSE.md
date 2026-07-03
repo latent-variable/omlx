@@ -67,7 +67,15 @@ prefill; skip-first-sight / async capture is the obvious follow-up.
       and unknown archs decline (normal prefill runs)
 - [x] MTP: 27B-oQ4-mtp generates correctly from assembled caches (e2e)
 - [ ] Persist chunk store to SSD (currently in-memory, lost on restart)
-- [ ] Capture cost: skip-first-sight or async recording prefill
+- [ ] **Capture cost — blocking issue for daily use (2026-07-02 field test).**
+      Capture reruns a recording prefill of the WHOLE prompt whenever any
+      chunk is novel, synchronously in the scheduler after generation. In
+      agentic sessions the transcript grows every turn → every turn pays a
+      hidden full re-prefill; on the 27B this reads as multi-second post-
+      response lag / "stuck generating". Fix before this is usable day-to-
+      day: record linear inputs during the normal prefill (layer sink, the
+      upstream-mlx-vlm move) or at minimum skip-first-sight + capture only
+      novel spans, off the critical path.
 - [ ] Upstream the mlx-vlm capture/replay primitives (long-term home)
 
 ## Constraints
