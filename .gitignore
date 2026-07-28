@@ -123,10 +123,7 @@ docs/native_app_architecture.md
 uv.lock
 # generated TurboQuant memory report (machine-specific)
 tq_batch_memory.md
-<<<<<<< Updated upstream
-=======
 .venv-codex/
 .agents/
 AGENTS.md
 .claude/
->>>>>>> Stashed changes
