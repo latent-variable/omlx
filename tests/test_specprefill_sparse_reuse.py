@@ -324,3 +324,112 @@ class TestSchedulerGuards:
         assert request.cached_tokens == 0
         assert request.remaining_tokens == request.prompt_token_ids
         assert scheduler._specprefill_active_request_id is None
+
+
+class TestStoreRestoreWiring:
+    """The two scheduler halves must actually meet.
+
+    Every other test exercises one side. This drives the real store method and
+    then the real restore method, through a real prefix cache, the way two
+    consecutive turns of one conversation would.
+    """
+
+    @staticmethod
+    def _scheduler(prefix_cache):
+        from omlx.scheduler import Scheduler, SchedulerConfig
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.config = SchedulerConfig(model_name="test-model")
+        scheduler.block_aware_cache = prefix_cache
+        scheduler._specprefill_draft_model = object()
+        scheduler._sparse_prefix_index = SparsePrefixIndex()
+        scheduler._bypass_hot_cache_under_pressure = lambda: True
+        scheduler._release_paged_cache_for_request = lambda _rid: None
+        return scheduler
+
+    def test_a_stored_turn_is_found_by_the_next_turn(self, prefix_cache):
+        import types
+
+        rows = 205
+        cache_data, keys = _sparse_cache_data(rows)
+        scheduler = self._scheduler(prefix_cache)
+        scheduler._extract_cache_states = lambda _cache: (cache_data, None)
+
+        # --- turn one: 1025 prompt tokens, stored at the prompt boundary ---
+        turn_one_prompt = list(range(1025))
+        first = types.SimpleNamespace(
+            request_id="turn-1",
+            prompt_token_ids=turn_one_prompt,
+            specprefill_indices=[1, 2, 3],
+            specprefill_rope_offset=None,
+        )
+        scheduler._store_sparse_prefix_after_prefill(first, object())
+
+        # Stored for prompt[:-1] — the kickoff token is BatchGenerator's.
+        assert scheduler._sparse_prefix_index.candidates("test-model", 5000) == [1024]
+
+        # --- turn two: the same prompt plus an answer and a new question ---
+        second = types.SimpleNamespace(
+            request_id="turn-2",
+            prompt_token_ids=turn_one_prompt + list(range(2000, 2100)),
+            cached_tokens=0,
+            remaining_tokens=None,
+            prompt_cache=None,
+            shared_prefix_blocks=0,
+            vlm_inputs_embeds=None,
+            specprefill_indices=None,
+            specprefill_rope_offset=None,
+            specprefill_sparse_logical_tokens=0,
+            specprefill_sparse_physical_rows=0,
+            _specprefill_enabled=True,
+        )
+        scheduler._try_sparse_prefix_restore(second)
+
+        assert second.specprefill_sparse_logical_tokens == 1024
+        assert second.specprefill_sparse_physical_rows == rows
+        # The offset feeding _OffsetAdjustedRoPE and specprefill_position_offset.
+        assert second.specprefill_rope_offset == 1024 - rows
+        assert second.cached_tokens == 1024
+        # Only the genuinely new tokens are left to prefill/score.
+        assert second.remaining_tokens == turn_one_prompt[1024:] + list(
+            range(2000, 2100)
+        )
+        assert second.prompt_cache is not None
+        assert mx.array_equal(second.prompt_cache[0].state[0], keys)
+
+    def test_a_longer_dense_hit_beats_the_sparse_one(self, prefix_cache):
+        """An ordinary hit is exact; it wins whenever it covers as much."""
+        import types
+
+        cache_data, _ = _sparse_cache_data(205)
+        scheduler = self._scheduler(prefix_cache)
+        scheduler._extract_cache_states = lambda _cache: (cache_data, None)
+
+        prompt = list(range(4000))
+        first = types.SimpleNamespace(
+            request_id="t1",
+            prompt_token_ids=prompt[:1025],
+            specprefill_indices=[1],
+            specprefill_rope_offset=None,
+        )
+        scheduler._store_sparse_prefix_after_prefill(first, object())
+
+        second = types.SimpleNamespace(
+            request_id="t2",
+            prompt_token_ids=prompt,
+            cached_tokens=2048,  # a dense hit already covers more
+            remaining_tokens=prompt[2048:],
+            prompt_cache=["dense"],
+            shared_prefix_blocks=3,
+            vlm_inputs_embeds=None,
+            specprefill_indices=None,
+            specprefill_rope_offset=None,
+            specprefill_sparse_logical_tokens=0,
+            specprefill_sparse_physical_rows=0,
+            _specprefill_enabled=True,
+        )
+        scheduler._try_sparse_prefix_restore(second)
+
+        assert second.specprefill_rope_offset is None
+        assert second.cached_tokens == 2048
+        assert second.prompt_cache == ["dense"]
