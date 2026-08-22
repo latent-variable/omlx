@@ -213,6 +213,18 @@ class Request:
     specprefill_position_offset: int = 0  # RoPE offset = M - N
     specprefill_system_end: int = 0  # Token index where system prompt ends
 
+    # Sparse conversation-prefix reuse. Set when a stored SpecPrefill cache was
+    # restored for this request: the KV holds ``sparse_physical_rows`` rows
+    # standing in for ``sparse_logical_tokens`` logical tokens.
+    #
+    # ``specprefill_rope_offset`` is the constant that reconciles the two, and
+    # it is the isolation key for the whole request: whenever it is set, this
+    # request has a GLOBAL _OffsetAdjustedRoPE installed on the model, so it
+    # must run alone in its batch even when no sparse prefill happens this turn.
+    specprefill_sparse_logical_tokens: int = 0
+    specprefill_sparse_physical_rows: int = 0
+    specprefill_rope_offset: Optional[int] = None
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter

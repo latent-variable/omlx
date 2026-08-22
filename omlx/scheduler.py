@@ -1513,6 +1513,11 @@ class SchedulerConfig:
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
     gdn_sidecar_state_dtype: str = "fp32"
 
+    # Reuse the sparse conversation KV a SpecPrefill request leaves behind, so
+    # an agent session stops re-prefilling its whole history every turn. Off
+    # makes SpecPrefill behave exactly as it did before sparse reuse existed.
+    specprefill_sparse_reuse: bool = True
+
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
     model_path: str = ""  # Filesystem path to the model (e.g., "/cache/models--Org--Name/snapshots/abc123")
@@ -1947,6 +1952,12 @@ class Scheduler:
         self._draft_prefix_cache: Any | None = None
         # Track active specprefill request for RoPE cleanup
         self._specprefill_active_request_id: str | None = None
+        # Logical lengths at which sparse conversation prefixes were stored.
+        # In-memory only: a restart loses discoverability, the next turn
+        # re-prefills once, and the session is warm again.
+        from .specprefill.sparse_cache import SparsePrefixIndex
+
+        self._sparse_prefix_index = SparsePrefixIndex()
 
         # DEBUG-only prefix-cache divergence probe (issue #1003): recent
         # stored cache sequences, so a miss can be traced to the exact
@@ -6913,7 +6924,13 @@ class Scheduler:
         """
         if self.block_aware_cache is None:
             return None
-        if request.specprefill_indices is not None:
+        # Same reasoning as the completion-time guard: a sparse cache must
+        # never reach the ordinary domain, including via this fallback, and a
+        # restored-and-extended one is just as sparse as a freshly selected one.
+        if (
+            request.specprefill_indices is not None
+            or request.specprefill_rope_offset is not None
+        ):
             return None
 
         block_size = self.config.paged_cache_block_size
@@ -7892,8 +7909,10 @@ class Scheduler:
         # triage), decoded token context at DEBUG (issue #1003).
         self._log_prefix_divergence(request)
 
-        # SpecPrefill: score remaining tokens with draft model if applicable.
-        # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
+        # SpecPrefill: reuse a stored sparse conversation prefix, then score
+        # whatever tokens remain. Both must run AFTER the ordinary prefix-cache
+        # check so each only ever sees the still-uncached suffix.
+        self._try_sparse_prefix_restore(request)
         self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
 
@@ -8457,6 +8476,222 @@ class Scheduler:
             del self._vlm_mtp_active[uid]
 
         return responses
+
+    def _store_sparse_prefix_after_prefill(
+        self, request: Request, cache_to_use: Any
+    ) -> None:
+        """Persist this turn's sparse cache at the PROMPT boundary.
+
+        Called once prefill has finished and before BatchGenerator takes the
+        cache over, so the stored state covers exactly ``prompt_token_ids[:-1]``
+        -- everything but the generation-kickoff token, which BatchGenerator
+        processes itself.
+
+        The prompt boundary, not request completion, is deliberate. The cache
+        of a hybrid model carries fixed-size recurrent state that cannot be
+        trimmed back to an earlier point, so whatever is stored must already
+        end where the logical token sequence ends. Storing after generation
+        would bake the output in, and a reasoning model's next turn arrives
+        with ``<think>`` stripped -- the stored sequence would then never be a
+        prefix of it, and the entry could never hit.
+        """
+        if not getattr(self.config, "specprefill_sparse_reuse", True):
+            return
+        if self.block_aware_cache is None or cache_to_use is None:
+            return
+        if getattr(request, "skip_cache_store", False):
+            return
+        # Only requests carrying a sparse cache: either one produced this turn
+        # or one restored and extended.
+        if (
+            request.specprefill_indices is None
+            and request.specprefill_rope_offset is None
+        ):
+            return
+
+        prompt_tokens = list(request.prompt_token_ids or [])
+        logical_tokens = prompt_tokens[:-1]
+        if not logical_tokens:
+            return
+
+        from .specprefill.sparse_cache import should_store_sparse_prefix
+
+        try:
+            extracted_cache, model_cache_config = self._extract_cache_states(
+                cache_to_use
+            )
+            if not extracted_cache:
+                return
+            physical_rows = self.block_aware_cache._get_cache_seq_len(extracted_cache)
+            if not should_store_sparse_prefix(len(logical_tokens), physical_rows):
+                logger.debug(
+                    "Request %s: not storing sparse prefix (%d logical / %d rows)",
+                    request.request_id,
+                    len(logical_tokens),
+                    physical_rows,
+                )
+                return
+            stored = self.block_aware_cache.store_sparse_prefix(
+                f"{request.request_id}:specprefill-sparse-store",
+                logical_tokens,
+                extracted_cache,
+                model_cache_config=model_cache_config,
+            )
+            if stored:
+                self._sparse_prefix_index.record(
+                    self.config.model_name, len(logical_tokens)
+                )
+        except Exception as error:
+            # A failed store costs the next turn a re-prefill and nothing else,
+            # so it must never take the in-flight request down with it.
+            logger.debug(
+                "Request %s: sparse prefix store failed: %s",
+                request.request_id,
+                error,
+            )
+
+    def _install_sparse_rope_offset(self, request: Request) -> None:
+        """Install the global RoPE offset a restored sparse prefix requires.
+
+        The restored cache holds N' rows for M logical tokens, so every
+        subsequent query must have (M - N') added to its cache offset to land
+        on its true position. ``sparse_prefill`` does this itself; this is the
+        path where no sparse prefill runs and the wrapper is still needed.
+        """
+        from .patches.specprefill import (
+            _OffsetAdjustedRoPE,
+            _find_attention_layers,
+            _get_attn_module,
+            _unwrap_rope,
+            cleanup_rope,
+        )
+
+        adjustment = request.specprefill_rope_offset
+        if not adjustment:
+            # Nothing was dropped, so cache offsets already equal true
+            # positions and the genuine RoPE is correct as-is.
+            return
+
+        # Start from the genuine rope: a prior request may have left a wrapper
+        # behind if it never reached cleanup (#766).
+        cleanup_rope(self.model)
+        patched = 0
+        for _layer_idx, layer in _find_attention_layers(self.model):
+            attention_module = _get_attn_module(layer)
+            if attention_module is None or not hasattr(attention_module, "rope"):
+                continue
+            attention_module.rope = _OffsetAdjustedRoPE(
+                _unwrap_rope(attention_module.rope), adjustment
+            )
+            patched += 1
+        if patched == 0:
+            raise RuntimeError("no attention layers accepted a RoPE offset")
+
+        self._specprefill_active_request_id = request.request_id
+        logger.info(
+            "Request %s: dense prefill over restored sparse prefix "
+            "(%d logical / %d rows, rope adjustment %d) across %d layers",
+            request.request_id,
+            request.specprefill_sparse_logical_tokens,
+            request.specprefill_sparse_physical_rows,
+            adjustment,
+            patched,
+        )
+
+    def _abandon_sparse_prefix(self, request: Request) -> None:
+        """Drop a restored sparse prefix and return the request to a cold start.
+
+        Used when the offset wrapper could not be installed. Leaving the
+        restored cache in place while the model runs on genuine RoPE would
+        write this turn's KV at the wrong positions, so the whole prompt is
+        re-prefilled instead.
+        """
+        from .patches.specprefill import cleanup_rope
+
+        cleanup_rope(self.model)
+        if self._specprefill_active_request_id == request.request_id:
+            self._specprefill_active_request_id = None
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        request.specprefill_rope_offset = None
+        request.specprefill_sparse_logical_tokens = 0
+        request.specprefill_sparse_physical_rows = 0
+
+    def _try_sparse_prefix_restore(self, request: Request) -> None:
+        """Restore a stored sparse conversation prefix before draft scoring.
+
+        Runs after the ordinary prefix-cache lookup and before
+        ``_try_specprefill_scoring`` so that scoring only ever covers tokens
+        this turn genuinely adds. On a hit the request is re-based onto the
+        restored cache: ``cached_tokens`` becomes the LOGICAL length, which is
+        what ``plan_specprefill_scoring`` and ``specprefill_position_offset``
+        already consume, so the position math downstream needs no changes.
+
+        A hit installs a global RoPE offset on the model, so it also marks the
+        request for batch isolation via ``specprefill_rope_offset`` -- true
+        even when this turn ends up below the SpecPrefill threshold and
+        dense-prefills its new tokens instead.
+        """
+        if not getattr(self.config, "specprefill_sparse_reuse", True):
+            return
+        if self.block_aware_cache is None:
+            return
+        if self._specprefill_draft_model is None:
+            return
+        if not getattr(request, "_specprefill_enabled", False):
+            return
+        # Image/video embeddings bypass SpecPrefill entirely; leave those
+        # requests on the ordinary dense cache path.
+        if request.vlm_inputs_embeds is not None:
+            return
+        prompt_tokens = request.prompt_token_ids or []
+        if not prompt_tokens:
+            return
+
+        from .specprefill.sparse_cache import find_sparse_prefix
+
+        hit = find_sparse_prefix(
+            prefix_cache=self.block_aware_cache,
+            index=self._sparse_prefix_index,
+            model_name=self.config.model_name,
+            request_id=request.request_id,
+            prompt_tokens=list(prompt_tokens),
+            promote_to_hot_cache=not self._bypass_hot_cache_under_pressure(),
+        )
+        if hit is None:
+            return
+
+        # An ordinary hit is dense and exact, so it wins whenever it already
+        # covers at least as much of the prompt.
+        if hit.logical_tokens <= (request.cached_tokens or 0):
+            logger.debug(
+                "Request %s: ordinary cache hit (%d) >= sparse prefix (%d), "
+                "keeping the dense hit",
+                request.request_id,
+                request.cached_tokens or 0,
+                hit.logical_tokens,
+            )
+            return
+
+        # Replacing the ordinary hit: drop its blocks so they are not leaked.
+        self._release_paged_cache_for_request(request.request_id)
+
+        request.prompt_cache = hit.cache
+        request.cached_tokens = hit.logical_tokens
+        request.remaining_tokens = list(prompt_tokens[hit.logical_tokens :])
+        request.specprefill_sparse_logical_tokens = hit.logical_tokens
+        request.specprefill_sparse_physical_rows = hit.physical_rows
+        request.specprefill_rope_offset = hit.rope_adjustment
+        request.shared_prefix_blocks = 0
+        logger.info(
+            "Request %s: sparse prefix hit, %d logical tokens reused from %d "
+            "KV rows, %d tokens remaining",
+            request.request_id,
+            hit.logical_tokens,
+            hit.physical_rows,
+            len(request.remaining_tokens),
+        )
 
     def _try_specprefill_scoring(self, request: Request) -> None:
         """Score tokens with draft model if SpecPrefill is applicable.
@@ -9739,7 +9974,16 @@ class Scheduler:
             # SpecPrefill requests must be alone in the batch (RoPE patching
             # affects the entire model). Also block scheduling if another
             # specprefill request is already running (offset RoPE active).
-            request_is_specprefill = request.specprefill_indices is not None
+            #
+            # A restored sparse prefix installs the same global wrapper even
+            # when this turn adds too few tokens to sparse-prefill, so the
+            # isolation key is "does this request carry a RoPE offset", not
+            # "did it select sparse indices". Batching a plain request
+            # alongside one would give the plain request wrong positions.
+            request_is_specprefill = (
+                request.specprefill_indices is not None
+                or request.specprefill_rope_offset is not None
+            )
             if self._specprefill_active_request_id is not None:
                 # A specprefill request is decoding with its offset RoPE
                 # installed on the shared model. Defer everything, including
@@ -9975,6 +10219,9 @@ class Scheduler:
 
                     cleanup_rope(self.model)
                     request.specprefill_indices = None
+                    # A requeued request must not carry a RoPE offset for a
+                    # cache it no longer holds.
+                    self._abandon_sparse_prefix(request)
                     tracker.remove(request.request_id)
                     _sync_and_clear_cache(self._stream)
                     self._cleanup_prefill_abort_request(request)
@@ -10005,7 +10252,37 @@ class Scheduler:
                         request.cached_tokens = 0
                         request.remaining_tokens = request.prompt_token_ids
                         tokens_to_process = request.prompt_token_ids
+                    # The restored sparse prefix is gone with the cache it
+                    # described; leaving its offset set would make the
+                    # fall-through prefill run on a bogus RoPE wrapper.
+                    self._abandon_sparse_prefix(request)
+                    tokens_to_process = request.prompt_token_ids
+                    cache_to_use = None
                     # Fall through to normal prefill
+            # A restored sparse prefix whose turn added too few tokens to
+            # sparse-prefill still sits at cache offset N' while its next
+            # token belongs at logical position M. Install the same offset
+            # wrapper the sparse path uses so the ordinary dense prefill below
+            # writes this turn's KV at TRUE positions -- full fidelity on the
+            # new tokens, reused history underneath. Without this the request
+            # would silently prefill at N'+j and produce garbage.
+            if (
+                request.specprefill_indices is None
+                and request.specprefill_rope_offset is not None
+            ):
+                try:
+                    self._install_sparse_rope_offset(request)
+                except Exception as error:
+                    logger.error(
+                        "Request %s: could not install sparse RoPE offset (%s); "
+                        "dropping the sparse prefix and re-prefilling in full",
+                        request.request_id,
+                        error,
+                    )
+                    self._abandon_sparse_prefix(request)
+                    tokens_to_process = request.prompt_token_ids
+                    cache_to_use = None
+
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
             # Only the last token goes to insert() for the first decode step.
             # SpecPrefill already handled its own prefill above, so skip for those.
@@ -10282,6 +10559,12 @@ class Scheduler:
             # bubbles into the engine retry loop and presents as a hang.
             # See vllm-mlx-patched commit 8d4052b for the same root cause
             # in a sibling project, and #934 for the user-visible symptom.
+            #
+            # Persist the sparse cache before BatchGenerator takes it over.
+            # This is the one site both sparse paths converge on: a fresh
+            # sparse prefill, and a dense prefill layered on a restored one.
+            self._store_sparse_prefix_after_prefill(request, cache_to_use)
+
             per_row_lps = list(logits_processors) if logits_processors else []
             # insert() merges the prompt cache into the batch KV caches with
             # lazy ops; keep them on the engine stream so the next decode
@@ -10555,9 +10838,22 @@ class Scheduler:
                 raw_cache = getattr(response, "prompt_cache", None)
                 if raw_cache is not None:
                     try:
-                        # SpecPrefill: sparse KV data can't be stored in
-                        # paged cache (hash mismatch with full token IDs).
-                        if request.specprefill_indices is not None:
+                        # SpecPrefill: sparse KV holds N' rows for M logical
+                        # tokens, so it can never enter the ORDINARY paged
+                        # domain -- a plain request matching it would read
+                        # those rows as if they were the full token sequence.
+                        # It is persisted at the prompt boundary into the
+                        # sparse domain instead (see
+                        # _store_sparse_prefix_after_prefill).
+                        #
+                        # ``specprefill_rope_offset`` is part of the test on
+                        # purpose: a request that merely RESTORED a sparse
+                        # prefix and dense-prefilled on top still holds a
+                        # sparse cache, even though it selected no indices.
+                        if (
+                            request.specprefill_indices is not None
+                            or request.specprefill_rope_offset is not None
+                        ):
                             raw_cache = None
 
                         # For paged cache, extract actual tensor states

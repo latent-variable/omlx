@@ -119,6 +119,12 @@ def _wrap_cachelist_sub_marker(
         name = sub_class_names[sub_idx]
     return ("__nstate__", name, list(elements))
 _EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
+# SpecPrefill sparse conversation prefixes live in their OWN hash domain.
+# A sparse entry holds N' physical KV rows standing in for M logical tokens and
+# is only correct when replayed with the matching _OffsetAdjustedRoPE. A request
+# that is not running SpecPrefill must therefore never be able to match one, so
+# the domain separation here is a correctness guard, not a namespacing nicety.
+_SPECPREFILL_SPARSE_KEY = "specprefill-sparse-conv-v1"
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 
 
@@ -264,6 +270,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_hits = 0
         self._exact_prefix_misses = 0
         self._exact_prefix_tokens_restored = 0
+        self._sparse_prefix_hits = 0
+        self._sparse_prefix_misses = 0
+        self._sparse_prefix_tokens_restored = 0
+        self._sparse_prefix_store_failures = 0
+        self._sparse_prefix_stored = 0
         self._exact_prefix_stores = 0
         self._exact_prefix_store_failures = 0
         self._gdn_checkpoint_loads = 0
@@ -1521,6 +1532,232 @@ class BlockAwarePrefixCache(CacheManager):
             self._exact_prefix_hits += 1
             self._exact_prefix_tokens_restored += len(tokens)
             return restored_cache
+        finally:
+            self.release_cache(request_id)
+
+    # ------------------------------------------------------------------
+    # SpecPrefill sparse conversation prefixes
+    #
+    # A sparse prefix is the KV a sparse_prefill() produced: N' physical rows
+    # standing in for M logical tokens, with each stored key already carrying
+    # its ORIGINAL RoPE angle. Because RoPE is relative, such a cache stays
+    # valid as a prefix for a growing conversation -- the next turn appends at
+    # logical position M while the cache offset sits at N', and the
+    # _OffsetAdjustedRoPE(M - N') the caller installs reconciles the two.
+    #
+    # Two properties make this storable at all, and both are asserted here
+    # rather than assumed:
+    #   1. The payload is opaque. It is never sliced per block, so the
+    #      physical/logical mismatch that makes ordinary block matching
+    #      impossible simply does not arise -- one chain hash over the logical
+    #      tokens keys one whole-state block.
+    #   2. It is domain-separated. Only a SpecPrefill request may match it.
+    # ------------------------------------------------------------------
+
+    def _sparse_prefix_hash(self, logical_tokens: list[int]) -> "BlockHash | None":
+        """Chain-hash a logical token sequence inside the sparse domain.
+
+        Every block in the chain carries the sparse domain key, so a sparse
+        entry can never collide with an ordinary prefix block or with a
+        static exact-prefix terminal covering the same tokens.
+        """
+        if not logical_tokens:
+            return None
+        parent_hash: BlockHash | None = None
+        for block_start in range(0, len(logical_tokens), self.block_size):
+            block_tokens = logical_tokens[block_start : block_start + self.block_size]
+            parent_hash = compute_block_hash(
+                parent_hash,
+                block_tokens,
+                extra_keys=(_SPECPREFILL_SPARSE_KEY,),
+                model_name=self.paged_cache.model_name,
+            )
+        return parent_hash
+
+    def store_sparse_prefix(
+        self,
+        request_id: str,
+        logical_tokens: list[int],
+        cache_data: list[dict[str, Any]],
+        model_cache_config: ModelCacheConfig | None = None,
+    ) -> bool:
+        """Persist a sparse SpecPrefill cache keyed by its LOGICAL tokens.
+
+        ``cache_data`` is the extracted state whose sliceable layers hold N'
+        physical rows; ``logical_tokens`` is the full M-token sequence those
+        rows stand for. The stored ``token_count`` is M so a later lookup can
+        recover the logical length, and the physical row count is re-derived
+        from the payload on restore.
+        """
+        if not logical_tokens or self.paged_ssd_cache is None or not cache_data:
+            return False
+
+        layer_cache_types = None
+        layer_meta_states = None
+        if model_cache_config:
+            layer_cache_types = model_cache_config.get_type_names()
+            layer_meta_states = [
+                cache_data[i].get("meta_state", ()) if i < len(cache_data) else ()
+                for i in range(model_cache_config.num_layers)
+            ]
+        else:
+            layer_cache_types = [
+                (
+                    layer_state.get(
+                        "class_name", layer_state.get("cache_type", "KVCache")
+                    )
+                    if layer_state.get("class_name", "")
+                    in ("TurboQuantKVCache", "BatchTurboQuantKVCache")
+                    else layer_state.get("cache_type", "KVCache")
+                )
+                for layer_state in cache_data
+                if isinstance(layer_state, dict)
+            ]
+            layer_meta_states = [
+                layer_state.get("meta_state", ())
+                for layer_state in cache_data
+                if isinstance(layer_state, dict)
+            ]
+
+        # Same refusal as the static exact prefix: a split-GDN layout has no
+        # boundary-snapshot provider here, so its recurrent state could never
+        # be reconstructed. Fail closed rather than store an unusable entry.
+        if self._gdn_split_layout_supported(layer_cache_types):
+            logger.info(
+                "Skipping sparse-prefix store for %s: split-GDN sidecar "
+                "commit is unavailable",
+                request_id,
+            )
+            self._sparse_prefix_store_failures += 1
+            return False
+
+        block_hash = self._sparse_prefix_hash(logical_tokens)
+        if block_hash is None:
+            self._sparse_prefix_store_failures += 1
+            return False
+
+        physical_rows = self._get_cache_seq_len(cache_data)
+        if physical_rows <= 0:
+            self._sparse_prefix_store_failures += 1
+            return False
+
+        # The whole sparse state is one opaque payload: is_last_block=True so
+        # non-sliceable layers contribute their full state rather than a
+        # placeholder, and the sliceable ones contribute all N' rows.
+        block_kv_data = self._extract_block_tensor_slice(
+            cache_data,
+            0,
+            physical_rows,
+            model_cache_config,
+            is_last_block=True,
+        )
+        if not block_kv_data:
+            self._sparse_prefix_store_failures += 1
+            return False
+
+        block = self.paged_cache.allocate_block()
+        if block is None:
+            if not self.paged_cache.handle_memory_pressure(1):
+                self._sparse_prefix_store_failures += 1
+                return False
+            block = self.paged_cache.allocate_block()
+            if block is None:
+                self._sparse_prefix_store_failures += 1
+                return False
+
+        block.block_hash = block_hash
+        block.token_count = len(logical_tokens)
+
+        saved = self.paged_ssd_cache.save_block(
+            block_hash=block_hash,
+            cache_data=block_kv_data,
+            token_count=len(logical_tokens),
+            model_name=self.paged_cache.model_name,
+            layer_cache_types=layer_cache_types,
+            layer_meta_states=layer_meta_states,
+            replace_existing=False,
+        )
+        if not saved:
+            self.paged_cache.free_block(block.block_id)
+            self._sparse_prefix_store_failures += 1
+            return False
+
+        # Keep the block discoverable with zero references so it is indexed
+        # for lookup but stays evictable under pressure.
+        block.ref_count = 0
+        self.paged_cache.cached_block_hash_to_block.insert(block_hash, block)
+        self._sparse_prefix_stored += 1
+        logger.info(
+            "SpecPrefill: stored sparse prefix, %d logical tokens over %d "
+            "physical KV rows (%.0f%% keep)",
+            len(logical_tokens),
+            physical_rows,
+            100.0 * physical_rows / max(1, len(logical_tokens)),
+        )
+        return True
+
+    def restore_sparse_prefix(
+        self,
+        request_id: str,
+        logical_tokens: list[int],
+        *,
+        promote_to_hot_cache: bool = True,
+    ) -> tuple[list[Any], int] | None:
+        """Reconstruct a sparse prefix stored for exactly ``logical_tokens``.
+
+        Returns ``(cache_objects, logical_token_count)`` or None on a miss.
+        The caller derives the RoPE adjustment from the restored cache offset
+        (N') and the returned logical count (M).
+        """
+        if not logical_tokens or self.paged_ssd_cache is None:
+            return None
+
+        block_hash = self._sparse_prefix_hash(logical_tokens)
+        if block_hash is None:
+            return None
+
+        cached_block = self.paged_cache.cached_block_hash_to_block.get_block(block_hash)
+        if cached_block is None:
+            if not self.paged_ssd_cache.has_block(block_hash):
+                self._sparse_prefix_misses += 1
+                return None
+            cached_block = self.paged_cache.allocate_block()
+            if cached_block is None:
+                self._sparse_prefix_misses += 1
+                return None
+            cached_block.block_hash = block_hash
+            cached_block.token_count = len(logical_tokens)
+            cached_block.ref_count = 0
+            self.paged_cache.cached_block_hash_to_block.insert(
+                block_hash, cached_block
+            )
+
+        acquired = self.paged_cache.acquire_cached_block(
+            cached_block.block_id, block_hash
+        )
+        if acquired is None:
+            self._sparse_prefix_misses += 1
+            return None
+
+        block_table = self.paged_cache.create_block_table(request_id)
+        block_table.add_block(acquired.block_id, acquired.token_count)
+        self._request_tables[request_id] = BlockCacheEntry(
+            block_table=block_table,
+            last_access=time.time(),
+        )
+        try:
+            if promote_to_hot_cache:
+                self.preload_blocks(block_table)
+            restored = self.reconstruct_cache(
+                block_table,
+                promote_to_hot_cache=promote_to_hot_cache,
+            )
+            if restored is None:
+                self._sparse_prefix_misses += 1
+                return None
+            self._sparse_prefix_hits += 1
+            self._sparse_prefix_tokens_restored += len(logical_tokens)
+            return restored, len(logical_tokens)
         finally:
             self.release_cache(request_id)
 
@@ -4670,6 +4907,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_hits = 0
         self._exact_prefix_misses = 0
         self._exact_prefix_tokens_restored = 0
+        self._sparse_prefix_hits = 0
+        self._sparse_prefix_misses = 0
+        self._sparse_prefix_tokens_restored = 0
+        self._sparse_prefix_store_failures = 0
+        self._sparse_prefix_stored = 0
         self._exact_prefix_stores = 0
         self._exact_prefix_store_failures = 0
         self._gdn_checkpoint_loads = 0
