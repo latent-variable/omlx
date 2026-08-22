@@ -1585,7 +1585,7 @@ class BlockAwarePrefixCache(CacheManager):
         model_cache_config: ModelCacheConfig | None = None,
         variant_key: str = "",
         supersedes: list[int] | None = None,
-    ) -> bool:
+    ) -> tuple[bool, list[int]]:
         """Persist a sparse SpecPrefill cache keyed by its LOGICAL tokens.
 
         ``cache_data`` is the extracted state whose sliceable layers hold N'
@@ -1595,7 +1595,7 @@ class BlockAwarePrefixCache(CacheManager):
         from the payload on restore.
         """
         if not logical_tokens or self.paged_ssd_cache is None or not cache_data:
-            return False
+            return False, []
 
         layer_cache_types = None
         layer_meta_states = None
@@ -1634,17 +1634,17 @@ class BlockAwarePrefixCache(CacheManager):
                 request_id,
             )
             self._sparse_prefix_store_failures += 1
-            return False
+            return False, []
 
         block_hash = self._sparse_prefix_hash(logical_tokens, variant_key)
         if block_hash is None:
             self._sparse_prefix_store_failures += 1
-            return False
+            return False, []
 
         physical_rows = self._get_cache_seq_len(cache_data)
         if physical_rows <= 0:
             self._sparse_prefix_store_failures += 1
-            return False
+            return False, []
 
         # The whole sparse state is one opaque payload: is_last_block=True so
         # non-sliceable layers contribute their full state rather than a
@@ -1658,7 +1658,7 @@ class BlockAwarePrefixCache(CacheManager):
         )
         if not block_kv_data:
             self._sparse_prefix_store_failures += 1
-            return False
+            return False, []
 
         block = self.paged_cache.allocate_block()
         if block is None:
@@ -1685,7 +1685,7 @@ class BlockAwarePrefixCache(CacheManager):
         if not saved:
             self.paged_cache.free_block(block.block_id)
             self._sparse_prefix_store_failures += 1
-            return False
+            return False, []
 
         # Keep the block discoverable with zero references so it is indexed
         # for lookup but stays evictable under pressure.
@@ -1701,6 +1701,7 @@ class BlockAwarePrefixCache(CacheManager):
         # SSD is the right tier to target: a restored sparse block is released
         # from the in-memory map as soon as its request finishes, so the hot
         # side may hold nothing at all while the durable copy persists.
+        superseded_lengths: list[int] = []
         for superseded_length in supersedes or []:
             if superseded_length >= len(logical_tokens):
                 continue
@@ -1724,6 +1725,7 @@ class BlockAwarePrefixCache(CacheManager):
             try:
                 if self.paged_ssd_cache.delete_block(stale_hash):
                     self._sparse_prefix_superseded += 1
+                    superseded_lengths.append(superseded_length)
             except Exception as error:
                 logger.debug(
                     "Could not drop superseded sparse prefix (%d tokens): %s",
@@ -1737,7 +1739,7 @@ class BlockAwarePrefixCache(CacheManager):
             physical_rows,
             100.0 * physical_rows / max(1, len(logical_tokens)),
         )
-        return True
+        return True, superseded_lengths
 
     def restore_sparse_prefix(
         self,

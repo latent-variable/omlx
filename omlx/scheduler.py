@@ -8547,7 +8547,7 @@ class Scheduler:
                 )
                 if length < len(logical_tokens)
             ]
-            stored = self.block_aware_cache.store_sparse_prefix(
+            stored, actually_superseded = self.block_aware_cache.store_sparse_prefix(
                 f"{request.request_id}:specprefill-sparse-store",
                 logical_tokens,
                 extracted_cache,
@@ -8559,7 +8559,13 @@ class Scheduler:
                 self._sparse_prefix_index.record(
                     self.config.model_name, len(logical_tokens)
                 )
-                for length in superseded:
+                # Only forget what was CONFIRMED deleted. Candidate lengths are
+                # shared across conversations, so a length that did not match
+                # here still has a live entry belonging to another one --
+                # forgetting it would strand that entry on disk, undiscoverable,
+                # and silently send its conversation back to full re-prefill
+                # every turn.
+                for length in actually_superseded:
                     self._sparse_prefix_index.forget(self.config.model_name, length)
         except Exception as error:
             # A failed store costs the next turn a re-prefill and nothing else,

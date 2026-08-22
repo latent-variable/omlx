@@ -53,7 +53,7 @@ class TestSparsePrefixStorage:
         logical = list(range(40))
         cache_data, keys = _sparse_cache_data(9)
 
-        assert prefix_cache.store_sparse_prefix("store", logical, cache_data)
+        assert prefix_cache.store_sparse_prefix("store", logical, cache_data)[0]
 
         restored = prefix_cache.restore_sparse_prefix(
             "restore", logical, promote_to_hot_cache=False
@@ -170,7 +170,7 @@ class TestFindSparsePrefix:
             assert prefix_cache.store_sparse_prefix(
                 f"s{length}", prompt[:length], cache_data,
                 variant_key="keep=0.2;draft=d",
-            )
+            )[0]
             index.record("model", length)
 
         hit = find_sparse_prefix(
@@ -539,7 +539,7 @@ class TestSelectionPolicyIsolation:
 
         assert prefix_cache.store_sparse_prefix(
             "s", tokens, cache_data, variant_key=sparse
-        )
+        )[0]
         assert (
             prefix_cache.restore_sparse_prefix(
                 "same", tokens, variant_key=sparse, promote_to_hot_cache=False
@@ -636,14 +636,16 @@ class TestSupersededEntriesAreReleased:
 
         assert prefix_cache.store_sparse_prefix(
             "turn1", tokens[:1024], short, variant_key=key
-        )
+        )[0]
         assert prefix_cache.restore_sparse_prefix(
             "probe", tokens[:1024], variant_key=key, promote_to_hot_cache=False
         ) is not None
 
-        assert prefix_cache.store_sparse_prefix(
+        stored, superseded = prefix_cache.store_sparse_prefix(
             "turn2", tokens[:2048], long_, variant_key=key, supersedes=[1024]
         )
+        assert stored
+        assert superseded == [1024]
         assert prefix_cache.get_stats().sparse_prefix_superseded == 1
         # The outcome, not just the counter: the shorter entry is really gone
         # from the durable tier, so it cannot be restored any more.
@@ -664,3 +666,58 @@ class TestSupersededEntriesAreReleased:
         )
         # 2048 > 1024, so it is not contained and must be left alone.
         assert prefix_cache.get_stats().sparse_prefix_superseded == 0
+
+
+class TestConversationsDoNotEvictEachOther:
+    """Candidate lengths are shared across conversations; entries are not.
+
+    A server runs many sessions at once, so "some conversation stored 1024
+    tokens" says nothing about whose. Superseding by LENGTH alone would let one
+    conversation strand another's entry on disk — still stored, no longer
+    discoverable — sending it back to full re-prefill every turn, which is the
+    exact failure this feature exists to remove.
+    """
+
+    def test_storing_one_conversation_leaves_another_intact(self, prefix_cache):
+        key = "keep=0.2;draft=d"
+        alice = list(range(0, 4096))
+        bob = list(range(100000, 104096))
+        data_a, _ = _sparse_cache_data(205)
+        data_b, _ = _sparse_cache_data(410)
+
+        assert prefix_cache.store_sparse_prefix(
+            "alice", alice[:1024], data_a, variant_key=key
+        )[0]
+
+        # Bob stores a LONGER prefix, and 1024 is a candidate length only
+        # because Alice put it there.
+        stored, superseded = prefix_cache.store_sparse_prefix(
+            "bob", bob[:2048], data_b, variant_key=key, supersedes=[1024]
+        )
+        assert stored
+        assert superseded == [], "Alice's entry is not a prefix of Bob's"
+
+        # Alice is still there, and still findable.
+        assert prefix_cache.restore_sparse_prefix(
+            "alice-again", alice[:1024], variant_key=key, promote_to_hot_cache=False
+        ) is not None
+        assert prefix_cache.restore_sparse_prefix(
+            "bob-again", bob[:2048], variant_key=key, promote_to_hot_cache=False
+        ) is not None
+
+    def test_the_index_only_forgets_confirmed_deletions(self):
+        """The scheduler half: forgetting is driven by what was deleted."""
+        index = SparsePrefixIndex()
+        index.record("m", 1024)   # Alice
+        index.record("m", 2048)   # Bob
+
+        # Bob's store reports it superseded nothing (Alice did not match).
+        for length in []:
+            index.forget("m", length)
+
+        assert index.candidates("m", 8192) == [2048, 1024]
+
+        # A genuine supersession does remove the length.
+        for length in [1024]:
+            index.forget("m", length)
+        assert index.candidates("m", 8192) == [2048]
