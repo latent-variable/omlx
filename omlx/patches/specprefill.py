@@ -790,6 +790,104 @@ class _OffsetAdjustedRoPE:
         return getattr(object.__getattribute__(self, "_original"), name)
 
 
+
+# ===========================================================================
+# RoPE carriers
+#
+# Two conventions appear across the architectures SpecPrefill runs on:
+#
+#   ``.rope``        a callable module taking (x, offset=int). Positions are
+#                    implied by a scalar offset, so remapping means wrapping
+#                    the callable (_PositionMappedRoPE / _OffsetAdjustedRoPE).
+#
+#   ``.rotary_emb``  M-RoPE, as in mlx-vlm's Qwen3_5Attention. Positions arrive
+#                    as an explicit ``position_ids`` array on
+#                    ``apply_rotary(q, k, position_ids)``; when the caller
+#                    passes none, the attention derives a CONTIGUOUS range from
+#                    ``cache.offset``.
+#
+# Only the first was handled before, and the miss was silent: ``has_rope``
+# came back False for the second and sparse_prefill skipped position mapping
+# entirely, writing selected tokens at contiguous positions rather than their
+# originals. That is a correctness bug for every mlx-vlm Qwen3.5/3.6/3.8
+# checkpoint, not merely a missed optimisation.
+# ===========================================================================
+
+_ROPE_ATTRS = ("rope", "rotary_emb")
+
+
+def _get_rope_carrier(attn):
+    """Return ``(attr_name, module)`` for whichever RoPE convention is present."""
+    if attn is None:
+        return None
+    for attr in _ROPE_ATTRS:
+        module = getattr(attn, attr, None)
+        if module is not None:
+            return attr, module
+    return None
+
+
+def _has_rope_carrier(attn) -> bool:
+    return _get_rope_carrier(attn) is not None
+
+
+class _PositionMappedMRoPE:
+    """Rewrites M-RoPE ``position_ids`` onto the true original positions.
+
+    The attention module hands us the contiguous range it derived from the
+    cache offset, so the incoming ids ARE indices into the selected-token
+    sequence once ``cache_start`` is removed. Remapping is therefore a gather,
+    which stays lazy -- reading an id back to Python would force a sync on
+    every layer of every chunk.
+    """
+
+    def __init__(self, original, all_positions, cache_start=0):
+        self._original = original
+        self._all_positions = mx.array(all_positions).astype(mx.int32)
+        self._cache_start = _scalar_offset(cache_start)
+
+    def apply_rotary(self, q, k, position_ids, **kwargs):
+        indices = position_ids.astype(mx.int32) - int(self._cache_start)
+        indices = mx.clip(indices, 0, self._all_positions.size - 1)
+        mapped = self._all_positions[indices]
+        return self._original.apply_rotary(q, k, mapped, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_original"), name)
+
+
+class _OffsetAdjustedMRoPE:
+    """Adds a constant to M-RoPE ``position_ids`` after a sparse prefill.
+
+    The M-RoPE counterpart of _OffsetAdjustedRoPE: the cache holds N' rows for
+    M logical tokens, so every subsequent position needs (M - N') added.
+    """
+
+    def __init__(self, original, adjustment):
+        self._original = original
+        self._adjustment = adjustment
+
+    def apply_rotary(self, q, k, position_ids, **kwargs):
+        return self._original.apply_rotary(
+            q, k, position_ids + self._adjustment, **kwargs
+        )
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_original"), name)
+
+
+def _make_position_mapped(attr, original, positions, cache_start):
+    if attr == "rotary_emb":
+        return _PositionMappedMRoPE(original, positions, cache_start=cache_start)
+    return _PositionMappedRoPE(original, positions, cache_start=cache_start)
+
+
+def _make_offset_adjusted(attr, original, adjustment):
+    if attr == "rotary_emb":
+        return _OffsetAdjustedMRoPE(original, adjustment)
+    return _OffsetAdjustedRoPE(original, adjustment)
+
+
 def _unwrap_rope(rope):
     """Peel any sparse-prefill RoPE wrappers down to the genuine module.
 
@@ -798,8 +896,16 @@ def _unwrap_rope(rope):
     and, before this fix, crash in _PositionMappedRoPE. Always start from the
     genuine rope. See #766.
     """
-    while isinstance(rope, (_OffsetAdjustedRoPE, _PositionMappedRoPE)):
-        rope = rope._original
+    while isinstance(
+        rope,
+        (
+            _OffsetAdjustedRoPE,
+            _PositionMappedRoPE,
+            _OffsetAdjustedMRoPE,
+            _PositionMappedMRoPE,
+        ),
+    ):
+        rope = object.__getattribute__(rope, "_original")
     return rope
 
 
@@ -892,9 +998,16 @@ def sparse_prefill(
         else 0
     )
 
-    # Check if model has RoPE (Nemotron-H doesn't)
+    # Which RoPE convention does this architecture use? Nemotron-H has none;
+    # mlx-vlm Qwen3_5 exposes rotary_emb (M-RoPE) rather than rope. Before
+    # this covered both, the second fell through to has_rope=False and every
+    # selected token was written at a CONTIGUOUS position instead of its own.
     first_attn = _get_attn_module(attn_layers[0][1])
-    has_rope = hasattr(first_attn, "rope")
+    rope_attr = None
+    carrier = _get_rope_carrier(first_attn)
+    if carrier is not None:
+        rope_attr = carrier[0]
+    has_rope = rope_attr is not None
 
     # Patch RoPE for position-mapped prefill
     original_ropes = {}
@@ -902,12 +1015,16 @@ def sparse_prefill(
         for layer_idx, layer in attn_layers:
             attn = _get_attn_module(layer)
             # Start from the genuine rope: a prior sparse_prefill may have left
-            # an _OffsetAdjustedRoPE installed if cleanup_rope wasn't called
+            # a wrapper installed if cleanup_rope wasn't called
             # (multi-turn + partial cache hit). See #766.
-            genuine = _unwrap_rope(attn.rope)
+            genuine = _unwrap_rope(getattr(attn, rope_attr))
             original_ropes[layer_idx] = genuine
-            attn.rope = _PositionMappedRoPE(
-                genuine, selected_positions, cache_start=cache_start
+            setattr(
+                attn,
+                rope_attr,
+                _make_position_mapped(
+                    rope_attr, genuine, selected_positions, cache_start
+                ),
             )
 
     try:
@@ -945,9 +1062,13 @@ def sparse_prefill(
                 attn = _get_attn_module(layer)
                 original = original_ropes[layer_idx]
                 if adjustment > 0:
-                    attn.rope = _OffsetAdjustedRoPE(original, adjustment)
+                    setattr(
+                        attn,
+                        rope_attr,
+                        _make_offset_adjusted(rope_attr, original, adjustment),
+                    )
                 else:
-                    attn.rope = original
+                    setattr(attn, rope_attr, original)
 
     return logits
 
@@ -960,11 +1081,13 @@ def cleanup_rope(model):
     """
     for _, layer in _find_attention_layers(model):
         attn = _get_attn_module(layer)
-        if attn is None or not hasattr(attn, "rope"):
+        carrier = _get_rope_carrier(attn)
+        if carrier is None:
             continue
-        genuine = _unwrap_rope(attn.rope)
-        if genuine is not attn.rope:
-            attn.rope = genuine
+        attr, current = carrier
+        genuine = _unwrap_rope(current)
+        if genuine is not current:
+            setattr(attn, attr, genuine)
 
 
 # ===========================================================================
