@@ -219,3 +219,108 @@ class TestFindSparsePrefix:
             promote_to_hot_cache=False,
         )
         assert hit is None
+
+
+class TestSchedulerGuards:
+    """The paths by which a sparse cache could escape into ordinary reuse.
+
+    Each of these is a way a request WITHOUT the matching RoPE offset could
+    end up reading N' rows as though they were M tokens, which is silent
+    corruption rather than a visible failure.
+    """
+
+    @staticmethod
+    def _scheduler():
+        from omlx.scheduler import Scheduler, SchedulerConfig
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.config = SchedulerConfig(paged_cache_block_size=4)
+        return scheduler
+
+    @staticmethod
+    def _request(**overrides):
+        import types
+
+        base = dict(
+            request_id="r",
+            prompt_token_ids=list(range(16)),
+            specprefill_indices=None,
+            specprefill_rope_offset=None,
+        )
+        base.update(overrides)
+        return types.SimpleNamespace(**base)
+
+    def test_boundary_store_refuses_a_restored_sparse_request(self):
+        """A request that only RESTORED a prefix selected no indices...
+
+        ...but its cache is every bit as sparse, so the boundary-store
+        fallback must refuse it just the same.
+        """
+        scheduler = self._scheduler()
+        scheduler.block_aware_cache = object()
+
+        restored_only = self._request(specprefill_rope_offset=819)
+        assert (
+            scheduler._prepare_prompt_boundary_cache_store("r", restored_only, 0)
+            is None
+        )
+
+        freshly_selected = self._request(specprefill_indices=[1, 2, 3])
+        assert (
+            scheduler._prepare_prompt_boundary_cache_store("r", freshly_selected, 0)
+            is None
+        )
+
+    def test_restore_is_inert_without_a_draft_model(self):
+        scheduler = self._scheduler()
+        scheduler.block_aware_cache = object()
+        request = self._request(_specprefill_enabled=True)
+        # No _specprefill_draft_model attribute at all.
+        scheduler._try_sparse_prefix_restore(request)
+        assert request.specprefill_rope_offset is None
+
+    def test_restore_is_inert_when_disabled_by_config(self):
+        from omlx.scheduler import SchedulerConfig
+
+        scheduler = self._scheduler()
+        scheduler.config = SchedulerConfig(specprefill_sparse_reuse=False)
+        scheduler.block_aware_cache = object()
+        scheduler._specprefill_draft_model = object()
+        scheduler._sparse_prefix_index = SparsePrefixIndex()
+        request = self._request(_specprefill_enabled=True, vlm_inputs_embeds=None)
+        scheduler._try_sparse_prefix_restore(request)
+        assert request.specprefill_rope_offset is None
+
+    def test_restore_leaves_image_requests_on_the_dense_path(self):
+        """SpecPrefill already declines VLM embeddings; reuse must not re-open it."""
+        scheduler = self._scheduler()
+        scheduler.block_aware_cache = object()
+        scheduler._specprefill_draft_model = object()
+        scheduler._sparse_prefix_index = SparsePrefixIndex()
+        request = self._request(
+            _specprefill_enabled=True, vlm_inputs_embeds=object()
+        )
+        scheduler._try_sparse_prefix_restore(request)
+        assert request.specprefill_rope_offset is None
+
+    def test_abandoning_a_prefix_returns_the_request_to_a_cold_start(self):
+        scheduler = self._scheduler()
+        scheduler.model = None
+        scheduler._specprefill_active_request_id = "r"
+        request = self._request(
+            specprefill_rope_offset=819,
+            specprefill_sparse_logical_tokens=1024,
+            specprefill_sparse_physical_rows=205,
+            prompt_cache=["something"],
+            cached_tokens=1024,
+            remaining_tokens=[],
+        )
+        scheduler._abandon_sparse_prefix(request)
+
+        assert request.specprefill_rope_offset is None
+        assert request.specprefill_sparse_logical_tokens == 0
+        assert request.specprefill_sparse_physical_rows == 0
+        assert request.prompt_cache is None
+        assert request.cached_tokens == 0
+        assert request.remaining_tokens == request.prompt_token_ids
+        assert scheduler._specprefill_active_request_id is None

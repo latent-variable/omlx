@@ -330,6 +330,10 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # Reuse the sparse conversation KV a SpecPrefill request leaves behind so
+    # an agent session stops re-prefilling its whole history every turn. Set
+    # False to restore SpecPrefill's pre-reuse behaviour.
+    specprefill_sparse_reuse: bool = True
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -419,6 +423,7 @@ class CacheSettings:
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "specprefill_sparse_reuse": self.specprefill_sparse_reuse,
         }
 
     @classmethod
@@ -463,6 +468,9 @@ class CacheSettings:
             ).lower(),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
+            specprefill_sparse_reuse=bool(
+                data.get("specprefill_sparse_reuse", True)
+            ),
             hot_cache_max_size=hot_cache_max_size,
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
         )
@@ -1680,6 +1688,7 @@ class GlobalSettings:
                 self.cache.gdn_ssd_pending_max_size
             ),
             gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
+            specprefill_sparse_reuse=self.cache.specprefill_sparse_reuse,
         )
 
     def to_dict(self) -> dict[str, Any]:

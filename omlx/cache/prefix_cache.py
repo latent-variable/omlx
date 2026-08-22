@@ -4849,6 +4849,11 @@ class BlockAwarePrefixCache(CacheManager):
             exact_prefix_tokens_restored=self._exact_prefix_tokens_restored,
             exact_prefix_stores=self._exact_prefix_stores,
             exact_prefix_store_failures=self._exact_prefix_store_failures,
+            sparse_prefix_hits=self._sparse_prefix_hits,
+            sparse_prefix_misses=self._sparse_prefix_misses,
+            sparse_prefix_tokens_restored=self._sparse_prefix_tokens_restored,
+            sparse_prefix_stores=self._sparse_prefix_stored,
+            sparse_prefix_store_failures=self._sparse_prefix_store_failures,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -4882,6 +4887,11 @@ class BlockAwarePrefixCache(CacheManager):
             "exact_prefix_tokens_restored": self._exact_prefix_tokens_restored,
             "exact_prefix_stores": self._exact_prefix_stores,
             "exact_prefix_store_failures": self._exact_prefix_store_failures,
+            "sparse_prefix_hits": self._sparse_prefix_hits,
+            "sparse_prefix_misses": self._sparse_prefix_misses,
+            "sparse_prefix_tokens_restored": self._sparse_prefix_tokens_restored,
+            "sparse_prefix_stores": self._sparse_prefix_stored,
+            "sparse_prefix_store_failures": self._sparse_prefix_store_failures,
             "gdn_checkpoint_loads": self._gdn_checkpoint_loads,
             "gdn_checkpoint_walkbacks": self._gdn_checkpoint_walkbacks,
             "gdn_last_restore": (

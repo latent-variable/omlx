@@ -6929,7 +6929,7 @@ class Scheduler:
         # restored-and-extended one is just as sparse as a freshly selected one.
         if (
             request.specprefill_indices is not None
-            or request.specprefill_rope_offset is not None
+            or getattr(request, "specprefill_rope_offset", None) is not None
         ):
             return None
 
@@ -8505,7 +8505,7 @@ class Scheduler:
         # or one restored and extended.
         if (
             request.specprefill_indices is None
-            and request.specprefill_rope_offset is None
+            and getattr(request, "specprefill_rope_offset", None) is None
         ):
             return
 
@@ -8608,7 +8608,13 @@ class Scheduler:
         """
         from .patches.specprefill import cleanup_rope
 
-        cleanup_rope(self.model)
+        # This runs on failure paths, so it must not raise on top of whatever
+        # already went wrong -- the request state below is the part that
+        # matters, and leaving it half-reset is worse than a stale wrapper.
+        try:
+            cleanup_rope(self.model)
+        except Exception as error:
+            logger.debug("Sparse prefix abandon: RoPE cleanup failed: %s", error)
         if self._specprefill_active_request_id == request.request_id:
             self._specprefill_active_request_id = None
         request.prompt_cache = None
@@ -8637,7 +8643,12 @@ class Scheduler:
             return
         if self.block_aware_cache is None:
             return
-        if self._specprefill_draft_model is None:
+        # Defensive: a scheduler that never configured SpecPrefill (or a
+        # partially constructed one) has nothing to restore for.
+        if getattr(self, "_specprefill_draft_model", None) is None:
+            return
+        index = getattr(self, "_sparse_prefix_index", None)
+        if index is None:
             return
         if not getattr(request, "_specprefill_enabled", False):
             return
@@ -8653,7 +8664,7 @@ class Scheduler:
 
         hit = find_sparse_prefix(
             prefix_cache=self.block_aware_cache,
-            index=self._sparse_prefix_index,
+            index=index,
             model_name=self.config.model_name,
             request_id=request.request_id,
             prompt_tokens=list(prompt_tokens),
@@ -9982,7 +9993,7 @@ class Scheduler:
             # alongside one would give the plain request wrong positions.
             request_is_specprefill = (
                 request.specprefill_indices is not None
-                or request.specprefill_rope_offset is not None
+                or getattr(request, "specprefill_rope_offset", None) is not None
             )
             if self._specprefill_active_request_id is not None:
                 # A specprefill request is decoding with its offset RoPE
@@ -10268,7 +10279,7 @@ class Scheduler:
             # would silently prefill at N'+j and produce garbage.
             if (
                 request.specprefill_indices is None
-                and request.specprefill_rope_offset is not None
+                and getattr(request, "specprefill_rope_offset", None) is not None
             ):
                 try:
                     self._install_sparse_rope_offset(request)
@@ -10852,7 +10863,7 @@ class Scheduler:
                         # sparse cache, even though it selected no indices.
                         if (
                             request.specprefill_indices is not None
-                            or request.specprefill_rope_offset is not None
+                            or getattr(request, "specprefill_rope_offset", None) is not None
                         ):
                             raw_cache = None
 

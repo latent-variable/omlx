@@ -95,6 +95,12 @@ class PrefixCacheStats(BaseCacheStats):
     exact_prefix_tokens_restored: int = 0
     exact_prefix_stores: int = 0
     exact_prefix_store_failures: int = 0
+    # SpecPrefill sparse conversation prefixes (N' KV rows for M logical tokens)
+    sparse_prefix_hits: int = 0
+    sparse_prefix_misses: int = 0
+    sparse_prefix_tokens_restored: int = 0
+    sparse_prefix_stores: int = 0
+    sparse_prefix_store_failures: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -125,6 +131,11 @@ class PrefixCacheStats(BaseCacheStats):
         self.exact_prefix_tokens_restored = 0
         self.exact_prefix_stores = 0
         self.exact_prefix_store_failures = 0
+        self.sparse_prefix_hits = 0
+        self.sparse_prefix_misses = 0
+        self.sparse_prefix_tokens_restored = 0
+        self.sparse_prefix_stores = 0
+        self.sparse_prefix_store_failures = 0
         self._total_queries = 0
 
 
