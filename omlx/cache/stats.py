@@ -101,6 +101,7 @@ class PrefixCacheStats(BaseCacheStats):
     sparse_prefix_tokens_restored: int = 0
     sparse_prefix_stores: int = 0
     sparse_prefix_store_failures: int = 0
+    sparse_prefix_superseded: int = 0
     _total_queries: int = field(default=0, repr=False)
 
     @property
@@ -136,6 +137,7 @@ class PrefixCacheStats(BaseCacheStats):
         self.sparse_prefix_tokens_restored = 0
         self.sparse_prefix_stores = 0
         self.sparse_prefix_store_failures = 0
+        self.sparse_prefix_superseded = 0
         self._total_queries = 0
 
 

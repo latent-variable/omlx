@@ -1164,6 +1164,9 @@ class TestScheduleWaitingSpecPrefillGuard:
         """
         sched = _make_scheduler(chunked_prefill=False)
         sched._specprefill_active_request_id = "active-req"
+        # A decoding request is in sched.running; the guard now reconciles the
+        # active id against that, so the stub has to reflect it.
+        sched.running["active-req"] = _make_request("active-req", n_tokens=4)
 
         req = _make_request("spec-2", n_tokens=10)
         req.specprefill_indices = mx.array([0, 2, 4])
@@ -1181,6 +1184,7 @@ class TestScheduleWaitingSpecPrefillGuard:
         """Non-specprefill requests keep deferring while one is active."""
         sched = _make_scheduler(chunked_prefill=False)
         sched._specprefill_active_request_id = "active-req"
+        sched.running["active-req"] = _make_request("active-req", n_tokens=4)
 
         req = _make_request("normal", n_tokens=10)
         sched.add_request(req)
@@ -1371,3 +1375,42 @@ class TestPrefillCleanupUsesEngineStream:
 
         assert len(rejected) == 1
         self._assert_engine_stream(streams, sched)
+
+
+class TestRestoredSparsePrefixNeverChunks:
+    """A request prefilling over a restored sparse prefix owns a GLOBAL RoPE
+    wrapper. Chunking would spread that across step() calls, and between them
+    another request could be admitted and silently prefill at the wrong
+    positions. It finishes in one pass or not at all, like a sparse prefill.
+    """
+
+    def test_a_restored_prefix_request_does_not_enter_chunked_prefill(self):
+        sched = _make_scheduler(chunked_prefill=True, step_size=4)
+        req = _make_request("restored", n_tokens=64)
+        req.specprefill_rope_offset = 819
+        req.specprefill_sparse_logical_tokens = 1024
+        req.specprefill_sparse_physical_rows = 205
+        sched.add_request(req)
+
+        with patch.object(sched, "_install_sparse_rope_offset"):
+            with patch.object(sched, "_begin_prefill") as mock_begin:
+                with patch.object(
+                    sched, "_do_external_prefill", return_value=(None, [7])
+                ) as mock_ep:
+                    sched._schedule_waiting()
+
+        mock_begin.assert_not_called()
+        assert mock_ep.called, "it must still prefill, just in one pass"
+
+    def test_an_ordinary_long_request_still_chunks(self):
+        """The control: without the wrapper, chunking is unchanged."""
+        sched = _make_scheduler(chunked_prefill=True, step_size=4)
+        req = _make_request("ordinary", n_tokens=64)
+        sched.add_request(req)
+
+        with patch.object(
+            sched, "_begin_prefill", return_value=_make_prefill_state(sched, req)
+        ) as mock_begin:
+            sched._schedule_waiting()
+
+        mock_begin.assert_called()

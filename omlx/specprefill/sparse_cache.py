@@ -49,6 +49,22 @@ MAX_INDEXED_LENGTHS = 512
 MIN_SPARSE_PREFIX_TOKENS = 512
 
 
+def sparse_variant_key(
+    *, keep_pct: float | None, draft_model_name: str, default_keep_pct: float
+) -> str:
+    """Identify which SELECTION POLICY produced a sparse payload.
+
+    Two requests over the same tokens do not get interchangeable caches: a
+    different keep rate selects a different subset, and a different drafter
+    scores importance differently. Both are per-request settings in the public
+    API, so without this in the key the first variant to land would silently
+    answer every later request and quietly override the quality/cost setting
+    it explicitly asked for.
+    """
+    effective_keep = keep_pct if keep_pct else default_keep_pct
+    return f"keep={round(float(effective_keep), 4)};draft={draft_model_name}"
+
+
 @dataclass(frozen=True)
 class SparsePrefixHit:
     """A restored sparse conversation prefix."""
@@ -103,6 +119,13 @@ class SparsePrefixIndex:
         usable.sort(reverse=True)
         return usable[:MAX_LOOKUP_PROBES]
 
+    def forget(self, model_name: str, logical_length: int) -> None:
+        """Drop a length whose entry has been superseded and released."""
+        with self._lock:
+            lengths = self._lengths.get(model_name)
+            if lengths is not None:
+                lengths.pop(logical_length, None)
+
     def clear(self, model_name: str | None = None) -> None:
         with self._lock:
             if model_name is None:
@@ -118,6 +141,7 @@ def find_sparse_prefix(
     model_name: str,
     request_id: str,
     prompt_tokens: list[int],
+    variant_key: str,
     promote_to_hot_cache: bool = True,
 ) -> SparsePrefixHit | None:
     """Restore the longest stored sparse prefix of ``prompt_tokens``.
@@ -137,12 +161,20 @@ def find_sparse_prefix(
         # A stored prefix is only usable if the current prompt still begins
         # with exactly those tokens; the hash check below enforces that, but
         # bail early when the whole prompt is shorter.
-        if logical_length > len(prompt_tokens):
+        if logical_length >= len(prompt_tokens):
+            # An exact-length hit would leave no uncached generation-kickoff
+            # token. The scheduler would send the prompt's final token anyway,
+            # over a cache that already contains that position, and the next
+            # prompt-boundary store would then label an over-long cache with a
+            # shorter logical sequence. A hybrid's recurrent state cannot be
+            # trimmed back by one token, so there is no safe repair; require a
+            # genuinely uncached tail instead.
             continue
         try:
             restored = restore(
                 f"{request_id}:specprefill-sparse-restore",
                 prompt_tokens[:logical_length],
+                variant_key=variant_key,
                 promote_to_hot_cache=promote_to_hot_cache,
             )
         except Exception as error:  # pragma: no cover - defensive

@@ -275,6 +275,7 @@ class BlockAwarePrefixCache(CacheManager):
         self._sparse_prefix_tokens_restored = 0
         self._sparse_prefix_store_failures = 0
         self._sparse_prefix_stored = 0
+        self._sparse_prefix_superseded = 0
         self._exact_prefix_stores = 0
         self._exact_prefix_store_failures = 0
         self._gdn_checkpoint_loads = 0
@@ -1554,7 +1555,9 @@ class BlockAwarePrefixCache(CacheManager):
     #   2. It is domain-separated. Only a SpecPrefill request may match it.
     # ------------------------------------------------------------------
 
-    def _sparse_prefix_hash(self, logical_tokens: list[int]) -> "BlockHash | None":
+    def _sparse_prefix_hash(
+        self, logical_tokens: list[int], variant_key: str = ""
+    ) -> "BlockHash | None":
         """Chain-hash a logical token sequence inside the sparse domain.
 
         Every block in the chain carries the sparse domain key, so a sparse
@@ -1569,7 +1572,7 @@ class BlockAwarePrefixCache(CacheManager):
             parent_hash = compute_block_hash(
                 parent_hash,
                 block_tokens,
-                extra_keys=(_SPECPREFILL_SPARSE_KEY,),
+                extra_keys=(_SPECPREFILL_SPARSE_KEY, variant_key),
                 model_name=self.paged_cache.model_name,
             )
         return parent_hash
@@ -1580,6 +1583,8 @@ class BlockAwarePrefixCache(CacheManager):
         logical_tokens: list[int],
         cache_data: list[dict[str, Any]],
         model_cache_config: ModelCacheConfig | None = None,
+        variant_key: str = "",
+        supersedes: list[int] | None = None,
     ) -> bool:
         """Persist a sparse SpecPrefill cache keyed by its LOGICAL tokens.
 
@@ -1631,7 +1636,7 @@ class BlockAwarePrefixCache(CacheManager):
             self._sparse_prefix_store_failures += 1
             return False
 
-        block_hash = self._sparse_prefix_hash(logical_tokens)
+        block_hash = self._sparse_prefix_hash(logical_tokens, variant_key)
         if block_hash is None:
             self._sparse_prefix_store_failures += 1
             return False
@@ -1687,6 +1692,44 @@ class BlockAwarePrefixCache(CacheManager):
         block.ref_count = 0
         self.paged_cache.cached_block_hash_to_block.insert(block_hash, block)
         self._sparse_prefix_stored += 1
+
+        # A conversation's turns each store the whole cumulative prefix, so the
+        # shorter entries this one already contains are pure duplication. Left
+        # alone they occupy the SSD tier until ordinary eviction reaches them,
+        # pushing out unrelated entries first. Drop them explicitly.
+        #
+        # SSD is the right tier to target: a restored sparse block is released
+        # from the in-memory map as soon as its request finishes, so the hot
+        # side may hold nothing at all while the durable copy persists.
+        for superseded_length in supersedes or []:
+            if superseded_length >= len(logical_tokens):
+                continue
+            stale_hash = self._sparse_prefix_hash(
+                logical_tokens[:superseded_length], variant_key
+            )
+            if stale_hash is None:
+                continue
+            stale_block = self.paged_cache.cached_block_hash_to_block.get_block(
+                stale_hash
+            )
+            if stale_block is not None:
+                if stale_block.ref_count > 0:
+                    # Someone is mid-restore on it; leave it and let ordinary
+                    # eviction collect it later.
+                    continue
+                self.paged_cache.cached_block_hash_to_block.pop(
+                    stale_hash, stale_block.block_id
+                )
+                self.paged_cache.free_block(stale_block.block_id)
+            try:
+                if self.paged_ssd_cache.delete_block(stale_hash):
+                    self._sparse_prefix_superseded += 1
+            except Exception as error:
+                logger.debug(
+                    "Could not drop superseded sparse prefix (%d tokens): %s",
+                    superseded_length,
+                    error,
+                )
         logger.info(
             "SpecPrefill: stored sparse prefix, %d logical tokens over %d "
             "physical KV rows (%.0f%% keep)",
@@ -1701,6 +1744,7 @@ class BlockAwarePrefixCache(CacheManager):
         request_id: str,
         logical_tokens: list[int],
         *,
+        variant_key: str = "",
         promote_to_hot_cache: bool = True,
     ) -> tuple[list[Any], int] | None:
         """Reconstruct a sparse prefix stored for exactly ``logical_tokens``.
@@ -1712,7 +1756,7 @@ class BlockAwarePrefixCache(CacheManager):
         if not logical_tokens or self.paged_ssd_cache is None:
             return None
 
-        block_hash = self._sparse_prefix_hash(logical_tokens)
+        block_hash = self._sparse_prefix_hash(logical_tokens, variant_key)
         if block_hash is None:
             return None
 
@@ -4854,6 +4898,7 @@ class BlockAwarePrefixCache(CacheManager):
             sparse_prefix_tokens_restored=self._sparse_prefix_tokens_restored,
             sparse_prefix_stores=self._sparse_prefix_stored,
             sparse_prefix_store_failures=self._sparse_prefix_store_failures,
+            sparse_prefix_superseded=self._sparse_prefix_superseded,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -4892,6 +4937,7 @@ class BlockAwarePrefixCache(CacheManager):
             "sparse_prefix_tokens_restored": self._sparse_prefix_tokens_restored,
             "sparse_prefix_stores": self._sparse_prefix_stored,
             "sparse_prefix_store_failures": self._sparse_prefix_store_failures,
+            "sparse_prefix_superseded": self._sparse_prefix_superseded,
             "gdn_checkpoint_loads": self._gdn_checkpoint_loads,
             "gdn_checkpoint_walkbacks": self._gdn_checkpoint_walkbacks,
             "gdn_last_restore": (
@@ -4922,6 +4968,7 @@ class BlockAwarePrefixCache(CacheManager):
         self._sparse_prefix_tokens_restored = 0
         self._sparse_prefix_store_failures = 0
         self._sparse_prefix_stored = 0
+        self._sparse_prefix_superseded = 0
         self._exact_prefix_stores = 0
         self._exact_prefix_store_failures = 0
         self._gdn_checkpoint_loads = 0

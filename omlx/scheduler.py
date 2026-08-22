@@ -1958,6 +1958,7 @@ class Scheduler:
         from .specprefill.sparse_cache import SparsePrefixIndex
 
         self._sparse_prefix_index = SparsePrefixIndex()
+        self._specprefill_draft_model_name: str = ""
 
         # DEBUG-only prefix-cache divergence probe (issue #1003): recent
         # stored cache sequences, so a miss can be traced to the exact
@@ -7989,6 +7990,10 @@ class Scheduler:
                 "Could not close the previous SpecPrefill draft SSD cache manager"
             )
         self._specprefill_draft_model = draft_model
+        self._specprefill_draft_model_name = draft_model_name or ""
+        # Selections made by a different drafter are not interchangeable, so a
+        # swap must not let old sparse KV answer new requests.
+        self._sparse_prefix_index.clear()
         self._draft_prefix_cache = None
         if not draft_model_name:
             logger.info(
@@ -8531,16 +8536,31 @@ class Scheduler:
                     physical_rows,
                 )
                 return
+            variant_key = self._sparse_variant_key(request)
+            # Shorter prefixes of this same conversation are fully contained in
+            # what we are about to write, so hand them over to be released
+            # rather than left resident crowding out unrelated blocks.
+            superseded = [
+                length
+                for length in self._sparse_prefix_index.candidates(
+                    self.config.model_name, len(logical_tokens)
+                )
+                if length < len(logical_tokens)
+            ]
             stored = self.block_aware_cache.store_sparse_prefix(
                 f"{request.request_id}:specprefill-sparse-store",
                 logical_tokens,
                 extracted_cache,
                 model_cache_config=model_cache_config,
+                variant_key=variant_key,
+                supersedes=superseded,
             )
             if stored:
                 self._sparse_prefix_index.record(
                     self.config.model_name, len(logical_tokens)
                 )
+                for length in superseded:
+                    self._sparse_prefix_index.forget(self.config.model_name, length)
         except Exception as error:
             # A failed store costs the next turn a re-prefill and nothing else,
             # so it must never take the in-flight request down with it.
@@ -8549,6 +8569,54 @@ class Scheduler:
                 request.request_id,
                 error,
             )
+
+    def _sparse_variant_key(self, request: Request) -> str:
+        """Which selection policy this request's sparse KV belongs to."""
+        from .patches.specprefill import DEFAULT_KEEP_RATE
+        from .specprefill.sparse_cache import sparse_variant_key
+
+        return sparse_variant_key(
+            keep_pct=getattr(request, "_specprefill_keep_pct", None),
+            draft_model_name=getattr(self, "_specprefill_draft_model_name", "") or "",
+            default_keep_pct=DEFAULT_KEEP_RATE,
+        )
+
+    def _reconcile_stale_specprefill_owner(self) -> bool:
+        """Drop a RoPE wrapper whose owning request is no longer running.
+
+        ``_specprefill_active_request_id`` means "a RUNNING request owns the
+        global RoPE wrapper", and admission defers *every* request while it is
+        set. A prefill that exits between installing the wrapper and reaching
+        decode -- eviction pause, memory rejection, abort, retry -- leaves no
+        running request to ever clear it, and the scheduler then stalls
+        permanently.
+
+        Reconciling here, where the invariant is consumed, keeps it true for
+        exit paths that have no idea this feature exists, including ones added
+        later. Returns whether a stale owner was cleared.
+        """
+        owner = self._specprefill_active_request_id
+        if owner is None or owner in self.running:
+            return False
+        logger.warning(
+            "Clearing stale SpecPrefill RoPE wrapper owned by %s: "
+            "no such request is running",
+            owner,
+        )
+        # Clearing the id is what unblocks admission, so it happens whatever
+        # the RoPE restore does. This runs inside the scheduling loop: raising
+        # here would take down the whole step, which is strictly worse than the
+        # stall it exists to prevent. A surviving wrapper is harmless on its
+        # own -- every path that installs one calls cleanup_rope first.
+        try:
+            self._cleanup_specprefill(owner)
+        except Exception as error:
+            logger.warning(
+                "Stale SpecPrefill RoPE restore failed for %s: %s", owner, error
+            )
+        finally:
+            self._specprefill_active_request_id = None
+        return True
 
     def _install_sparse_rope_offset(self, request: Request) -> None:
         """Install the global RoPE offset a restored sparse prefix requires.
@@ -8587,7 +8655,6 @@ class Scheduler:
         if patched == 0:
             raise RuntimeError("no attention layers accepted a RoPE offset")
 
-        self._specprefill_active_request_id = request.request_id
         logger.info(
             "Request %s: dense prefill over restored sparse prefix "
             "(%d logical / %d rows, rope adjustment %d) across %d layers",
@@ -8668,6 +8735,7 @@ class Scheduler:
             model_name=self.config.model_name,
             request_id=request.request_id,
             prompt_tokens=list(prompt_tokens),
+            variant_key=self._sparse_variant_key(request),
             promote_to_hot_cache=not self._bypass_hot_cache_under_pressure(),
         )
         if hit is None:
@@ -9995,6 +10063,7 @@ class Scheduler:
                 request.specprefill_indices is not None
                 or getattr(request, "specprefill_rope_offset", None) is not None
             )
+            self._reconcile_stale_specprefill_owner()
             if self._specprefill_active_request_id is not None:
                 # A specprefill request is decoding with its offset RoPE
                 # installed on the shared model. Defer everything, including
@@ -10329,6 +10398,13 @@ class Scheduler:
                 if (
                     (self.config.chunked_prefill or force_chunk)
                     and vlm_embeds is None
+                    # A request prefilling over a restored sparse prefix owns a
+                    # GLOBAL RoPE wrapper. Chunking would spread that across
+                    # step() calls, and between them another request could be
+                    # admitted and silently prefill at the wrong positions.
+                    # Like a sparse prefill, it finishes in one pass or not at
+                    # all.
+                    and getattr(request, "specprefill_rope_offset", None) is None
                     and len(tokens_to_process) > chunk_threshold + 1
                 ):
                     sm = self._build_state_machine(request)
@@ -10574,6 +10650,14 @@ class Scheduler:
             # Persist the sparse cache before BatchGenerator takes it over.
             # This is the one site both sparse paths converge on: a fresh
             # sparse prefill, and a dense prefill layered on a restored one.
+            # Prefill is done and this request is about to start decoding, so
+            # it now genuinely owns the global RoPE wrapper. Arming earlier is
+            # what let a failed prefill strand the wrapper: every exit between
+            # installing it and here (eviction pause, memory rejection, abort,
+            # retry) leaves no running request to ever clear it.
+            if getattr(request, "specprefill_rope_offset", None) is not None:
+                self._specprefill_active_request_id = request.request_id
+
             self._store_sparse_prefix_after_prefill(request, cache_to_use)
 
             per_row_lps = list(logits_processors) if logits_processors else []

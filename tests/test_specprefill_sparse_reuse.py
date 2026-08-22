@@ -17,6 +17,7 @@ import pytest
 
 from omlx.specprefill.sparse_cache import (
     MIN_SPARSE_PREFIX_TOKENS,
+    sparse_variant_key,
     SparsePrefixHit,
     SparsePrefixIndex,
     find_sparse_prefix,
@@ -167,7 +168,8 @@ class TestFindSparsePrefix:
         for length in (1024, 2048):
             cache_data, _ = _sparse_cache_data(length // 5)
             assert prefix_cache.store_sparse_prefix(
-                f"s{length}", prompt[:length], cache_data
+                f"s{length}", prompt[:length], cache_data,
+                variant_key="keep=0.2;draft=d",
             )
             index.record("model", length)
 
@@ -177,6 +179,7 @@ class TestFindSparsePrefix:
             model_name="model",
             request_id="r",
             prompt_tokens=prompt,
+            variant_key="keep=0.2;draft=d",
             promote_to_hot_cache=False,
         )
         assert hit is not None
@@ -187,7 +190,9 @@ class TestFindSparsePrefix:
     def test_no_index_entry_means_no_lookup(self, prefix_cache):
         prompt = list(range(4000))
         cache_data, _ = _sparse_cache_data(205)
-        prefix_cache.store_sparse_prefix("s", prompt[:1024], cache_data)
+        prefix_cache.store_sparse_prefix(
+            "s", prompt[:1024], cache_data, variant_key="keep=0.2;draft=d"
+        )
 
         # Stored, but the index never learned the length, so it is not found.
         # This is the documented restart behaviour, asserted so it stays a
@@ -198,6 +203,7 @@ class TestFindSparsePrefix:
             model_name="model",
             request_id="r",
             prompt_tokens=prompt,
+            variant_key="keep=0.2;draft=d",
             promote_to_hot_cache=False,
         )
         assert hit is None
@@ -207,7 +213,9 @@ class TestFindSparsePrefix:
         index = SparsePrefixIndex()
         prompt = list(range(4000))
         cache_data, _ = _sparse_cache_data(2000)
-        prefix_cache.store_sparse_prefix("s", prompt[:1024], cache_data)
+        prefix_cache.store_sparse_prefix(
+            "s", prompt[:1024], cache_data, variant_key="keep=0.2;draft=d"
+        )
         index.record("model", 1024)
 
         hit = find_sparse_prefix(
@@ -216,6 +224,7 @@ class TestFindSparsePrefix:
             model_name="model",
             request_id="r",
             prompt_tokens=prompt,
+            variant_key="keep=0.2;draft=d",
             promote_to_hot_cache=False,
         )
         assert hit is None
@@ -433,3 +442,225 @@ class TestStoreRestoreWiring:
         assert second.specprefill_rope_offset is None
         assert second.cached_tokens == 2048
         assert second.prompt_cache == ["dense"]
+
+
+class TestStaleRopeOwner:
+    """A stranded RoPE wrapper must not stall the scheduler.
+
+    `_specprefill_active_request_id` gates admission for EVERY request. If a
+    prefill exits between installing the wrapper and reaching decode — the
+    eviction pause requeues the request, a memory rejection drops it entirely —
+    nothing is left running to clear it, and without reconciliation the
+    scheduler defers all work permanently.
+    """
+
+    @staticmethod
+    def _scheduler(running_ids=()):
+        from omlx.scheduler import Scheduler, SchedulerConfig
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.config = SchedulerConfig()
+        scheduler.running = {rid: object() for rid in running_ids}
+        scheduler.model = None
+        return scheduler
+
+    def test_owner_that_never_reached_decode_is_cleared(self):
+        """The eviction-pause and memory-rejection case."""
+        scheduler = self._scheduler(running_ids=())
+        scheduler._specprefill_active_request_id = "evicted-before-decode"
+
+        assert scheduler._reconcile_stale_specprefill_owner() is True
+        assert scheduler._specprefill_active_request_id is None
+
+    def test_a_live_owner_is_left_alone(self):
+        """The control: a genuinely decoding request keeps its wrapper.
+
+        Without this half, "clear it whenever" would corrupt the remaining
+        decode of the request that legitimately owns the offset (#766).
+        """
+        scheduler = self._scheduler(running_ids=("decoding-now",))
+        scheduler._specprefill_active_request_id = "decoding-now"
+
+        assert scheduler._reconcile_stale_specprefill_owner() is False
+        assert scheduler._specprefill_active_request_id == "decoding-now"
+
+    def test_no_owner_is_a_no_op(self):
+        scheduler = self._scheduler(running_ids=("someone",))
+        scheduler._specprefill_active_request_id = None
+        assert scheduler._reconcile_stale_specprefill_owner() is False
+
+    def test_installing_the_wrapper_does_not_claim_ownership(self):
+        """Arming happens after prefill succeeds, not when the wrapper goes on.
+
+        This is the actual fix for the stranding: everything between
+        installing the wrapper and reaching decode can still fail out.
+        """
+        import types
+
+        from omlx.patches import specprefill as sp
+
+        scheduler = self._scheduler()
+        scheduler._specprefill_active_request_id = None
+
+        layers = [types.SimpleNamespace(self_attn=types.SimpleNamespace(rope=object()))]
+        scheduler.model = types.SimpleNamespace(layers=layers)
+
+        request = types.SimpleNamespace(
+            request_id="r",
+            specprefill_rope_offset=819,
+            specprefill_sparse_logical_tokens=1024,
+            specprefill_sparse_physical_rows=205,
+        )
+        scheduler._install_sparse_rope_offset(request)
+
+        assert isinstance(layers[0].self_attn.rope, sp._OffsetAdjustedRoPE)
+        assert scheduler._specprefill_active_request_id is None
+
+
+class TestSelectionPolicyIsolation:
+    """Two keep rates over the same tokens are NOT interchangeable caches.
+
+    `specprefill_keep_pct` and the drafter are both per-request settings in the
+    public API, and each selects a different subset. Without the policy in the
+    key, whichever variant landed first would silently answer every later
+    request and override the quality/cost setting it explicitly asked for.
+    """
+
+    def test_a_different_keep_rate_does_not_reuse_the_cache(self, prefix_cache):
+        tokens = list(range(1024))
+        cache_data, _ = _sparse_cache_data(205)
+        sparse = sparse_variant_key(
+            keep_pct=0.2, draft_model_name="qwen-2b", default_keep_pct=0.2
+        )
+        denser = sparse_variant_key(
+            keep_pct=0.5, draft_model_name="qwen-2b", default_keep_pct=0.2
+        )
+        assert sparse != denser
+
+        assert prefix_cache.store_sparse_prefix(
+            "s", tokens, cache_data, variant_key=sparse
+        )
+        assert (
+            prefix_cache.restore_sparse_prefix(
+                "same", tokens, variant_key=sparse, promote_to_hot_cache=False
+            )
+            is not None
+        )
+        assert (
+            prefix_cache.restore_sparse_prefix(
+                "denser", tokens, variant_key=denser, promote_to_hot_cache=False
+            )
+            is None
+        )
+
+    def test_a_different_drafter_does_not_reuse_the_cache(self, prefix_cache):
+        tokens = list(range(1024))
+        cache_data, _ = _sparse_cache_data(205)
+        one = sparse_variant_key(
+            keep_pct=0.2, draft_model_name="qwen-2b", default_keep_pct=0.2
+        )
+        other = sparse_variant_key(
+            keep_pct=0.2, draft_model_name="qwen-4b", default_keep_pct=0.2
+        )
+        prefix_cache.store_sparse_prefix("s", tokens, cache_data, variant_key=one)
+
+        assert (
+            prefix_cache.restore_sparse_prefix(
+                "other", tokens, variant_key=other, promote_to_hot_cache=False
+            )
+            is None
+        )
+
+    def test_an_unset_keep_rate_resolves_to_the_default(self):
+        assert sparse_variant_key(
+            keep_pct=None, draft_model_name="d", default_keep_pct=0.2
+        ) == sparse_variant_key(
+            keep_pct=0.2, draft_model_name="d", default_keep_pct=0.2
+        )
+
+
+class TestExactLengthHitsAreRefused:
+    """A hit covering the WHOLE prompt leaves no generation-kickoff token.
+
+    The scheduler would send the prompt's final token anyway, over a cache that
+    already contains that position, and the next prompt-boundary store would
+    label an over-long cache with a shorter logical sequence. A hybrid's
+    recurrent state cannot be trimmed back one token, so there is no repair.
+    """
+
+    def test_a_prefix_covering_the_entire_prompt_is_skipped(self, prefix_cache):
+        index = SparsePrefixIndex()
+        prompt = list(range(1024))
+        cache_data, _ = _sparse_cache_data(205)
+        key = "keep=0.2;draft=d"
+        prefix_cache.store_sparse_prefix("s", prompt, cache_data, variant_key=key)
+        index.record("model", len(prompt))
+
+        assert (
+            find_sparse_prefix(
+                prefix_cache=prefix_cache,
+                index=index,
+                model_name="model",
+                request_id="r",
+                prompt_tokens=prompt,
+                variant_key=key,
+                promote_to_hot_cache=False,
+            )
+            is None
+        )
+
+        # One more token in the prompt and it is usable again.
+        assert (
+            find_sparse_prefix(
+                prefix_cache=prefix_cache,
+                index=index,
+                model_name="model",
+                request_id="r",
+                prompt_tokens=prompt + [9999],
+                variant_key=key,
+                promote_to_hot_cache=False,
+            )
+            is not None
+        )
+
+
+class TestSupersededEntriesAreReleased:
+    """Each turn stores the whole cumulative prefix; the shorter ones it
+    contains must not stay resident crowding out unrelated blocks."""
+
+    def test_storing_a_longer_prefix_releases_the_shorter_one(self, prefix_cache):
+        key = "keep=0.2;draft=d"
+        tokens = list(range(4096))
+        short, _ = _sparse_cache_data(205)
+        long_, _ = _sparse_cache_data(410)
+
+        assert prefix_cache.store_sparse_prefix(
+            "turn1", tokens[:1024], short, variant_key=key
+        )
+        assert prefix_cache.restore_sparse_prefix(
+            "probe", tokens[:1024], variant_key=key, promote_to_hot_cache=False
+        ) is not None
+
+        assert prefix_cache.store_sparse_prefix(
+            "turn2", tokens[:2048], long_, variant_key=key, supersedes=[1024]
+        )
+        assert prefix_cache.get_stats().sparse_prefix_superseded == 1
+        # The outcome, not just the counter: the shorter entry is really gone
+        # from the durable tier, so it cannot be restored any more.
+        assert prefix_cache.restore_sparse_prefix(
+            "gone", tokens[:1024], variant_key=key, promote_to_hot_cache=False
+        ) is None
+        # And the longer one, which contains it, is what a later turn finds.
+        assert prefix_cache.restore_sparse_prefix(
+            "probe2", tokens[:2048], variant_key=key, promote_to_hot_cache=False
+        ) is not None
+
+    def test_a_longer_length_is_never_treated_as_superseded(self, prefix_cache):
+        key = "keep=0.2;draft=d"
+        tokens = list(range(4096))
+        data, _ = _sparse_cache_data(205)
+        prefix_cache.store_sparse_prefix(
+            "t", tokens[:1024], data, variant_key=key, supersedes=[2048, 1024]
+        )
+        # 2048 > 1024, so it is not contained and must be left alone.
+        assert prefix_cache.get_stats().sparse_prefix_superseded == 0
