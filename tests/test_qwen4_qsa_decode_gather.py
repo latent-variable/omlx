@@ -114,6 +114,10 @@ def test_qwen4_language_wrapper_routes_2d_text_positions_to_gather(monkeypatch):
     config = _tiny_text_config()
     import mlx_vlm.models.qwen4_exp.language as language
 
+    # Covers the gathered routing itself, so open the native gate that
+    # otherwise declines gathered prefill without the sparse-GQA kernel.
+    monkeypatch.setattr(language, "_sparse_gqa_native_available", lambda: True)
+
     root_config = SimpleNamespace(
         vision_config=SimpleNamespace(spatial_merge_size=2),
         image_token_id=60,

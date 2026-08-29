@@ -630,6 +630,9 @@ def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
         calls.append((args[0].shape, args[1].shape))
         return gathered(*args, **kwargs)
 
+    # This test covers the gathered path itself, so open the native gate that
+    # normally declines it on builds without the sparse-GQA kernel.
+    monkeypatch.setattr(language, "_sparse_gqa_native_available", lambda: True)
     monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
     fast_cache = QSAKVCache()
     actual = attention(hidden, mask="causal", cache=fast_cache)
@@ -1423,3 +1426,85 @@ def test_qwen4_lightning_mtp_isolated_from_dense_qwen35_runtime_patch():
 
     assert resident_owner.mtp is not None
     assert later_owner.mtp is not None
+
+
+def test_qwen4_gathered_prefill_declines_without_the_sparse_gqa_kernel(monkeypatch):
+    """Without the native kernel the gathered prefill path must not be taken.
+
+    The MLX gather fallback is slower than the official mask path it replaces,
+    and the gap widens with context: on an M5 Max 128 GB running
+    Qwen3.8-Flash-Next-oQ4e-mtp, prompt processing measured 701 tok/s against
+    1110 at 12.2k tokens, and 260 against 669 at 29.4k.
+    """
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    attention = Qwen4ExpAttention(config.text_config)
+    mx.eval(attention.parameters())
+    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+
+    calls = []
+    gathered = language.contiguous_causal_gathered_qsa
+
+    def tracked(*args, **kwargs):
+        calls.append((args[0].shape, args[1].shape))
+        return gathered(*args, **kwargs)
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
+    monkeypatch.setattr(language, "_sparse_gqa_native_available", lambda: False)
+    gated = attention(hidden, mask="causal", cache=QSAKVCache())
+
+    monkeypatch.setattr(
+        Qwen4ExpAttention,
+        "_gathered_text_prefill_eligible",
+        staticmethod(lambda *args, **kwargs: False),
+    )
+    official = attention(hidden, mask="causal", cache=QSAKVCache())
+    mx.eval(gated, official)
+
+    # Declining is what is under test, so the gathered helper must never run,
+    # and the result must be the official path's bit-for-bit.
+    assert calls == []
+    assert mx.array_equal(gated, official).item()
+
+
+def test_qwen4_gathered_prefill_is_taken_when_the_kernel_is_present(monkeypatch):
+    """The gate opens again once the sparse-GQA kernel reports available."""
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    attention = Qwen4ExpAttention(config.text_config)
+    mx.eval(attention.parameters())
+    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+
+    calls = []
+    gathered = language.contiguous_causal_gathered_qsa
+
+    def tracked(*args, **kwargs):
+        calls.append((args[0].shape, args[1].shape))
+        return gathered(*args, **kwargs)
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
+    monkeypatch.setattr(language, "_sparse_gqa_native_available", lambda: True)
+    mx.eval(attention(hidden, mask="causal", cache=QSAKVCache()))
+
+    assert calls == [((1, 4, 20, 8), (1, 2, 20, 8))]
+
+
+def test_sparse_gqa_native_probe_is_false_when_the_import_fails(monkeypatch):
+    """A missing or broken custom-kernel package must read as unavailable."""
+    import builtins
+
+    import mlx_vlm.models.qwen4_exp.language as language
+
+    real_import = builtins.__import__
+
+    def refuse(name, *args, **kwargs):
+        if "glm_moe_dsa" in name:
+            raise ImportError("no native kernels in this build")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", refuse)
+    assert language._sparse_gqa_native_available() is False

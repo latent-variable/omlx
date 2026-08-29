@@ -1018,6 +1018,20 @@ class Qwen4ExpQSAIndexer(nn.Module):
         return selected_tokens[:, None]
 
 
+def _sparse_gqa_native_available() -> bool:
+    """True when the exact sparse-GQA kernel this path is built around exists."""
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        return bool(
+            fast.is_native_available()
+            and fast.has_symbol("qwen4_qsa_sparse_gqa_attention")
+        )
+    except Exception:
+        return False
+
+
 class Qwen4ExpAttention(Qwen3_5Attention):
     def __init__(self, config: TextConfig):
         super().__init__(config)
@@ -1061,6 +1075,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and not target_verify
             and self._batch_one_text_position_ids(position_ids, x.shape[1])
         ):
+            return False
+        if not _sparse_gqa_native_available():
+            # The MLX gather fallback is not a cheap stand-in for the native
+            # kernel here: it rebuilds the selected blocks in Python-visible
+            # ops, which costs more than the official mask path it replaces.
+            # Measured on an M5 Max 128 GB with Qwen3.8-Flash-Next-oQ4e-mtp,
+            # 12.2k-token prompt, n=3: 701 tok/s through this path against
+            # 1110 tok/s with it declined. Decode is unaffected either way.
             return False
         return bool(
             # Below the QSA budget the official path attends the complete
